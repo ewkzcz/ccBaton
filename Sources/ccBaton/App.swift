@@ -14,10 +14,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 struct CcBatonApp: App {
     @NSApplicationDelegateAdaptor(AppDelegate.self) private var delegate
     @StateObject private var store = AccountStore()
+    @StateObject private var desktop = DesktopStore()
 
     var body: some Scene {
         Window("ccBaton", id: "main") {
-            ContentView().environmentObject(store)
+            ContentView().environmentObject(store).environmentObject(desktop)
         }
         .windowStyle(.hiddenTitleBar)
         .defaultSize(width: 580, height: 600)

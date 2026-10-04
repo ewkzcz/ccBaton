@@ -1,11 +1,72 @@
 /**
- * 主窗口：账号列表，提供添加、切换、删除，以及保存当前登录的账号。
+ * 主窗口：顶部切换命令行和桌面端两个页面，各自管理账号的添加、切换、删除和保存。
  */
 import AppKit
 import SwiftUI
 
+/** Panel：主窗口的页面 */
+enum Panel: String, CaseIterable {
+    case cli, desktop
+
+    var title: String { self == .cli ? "命令行" : "桌面端" }
+}
+
 /** ContentView：主界面 */
 struct ContentView: View {
+    @AppStorage("panel") private var panel: Panel = .cli
+
+    var body: some View {
+        VStack(spacing: 0) {
+            HStack(spacing: 4) {
+                ForEach(Panel.allCases, id: \.self) { p in
+                    Button { withAnimation(.snappy) { panel = p } } label: {
+                        Text(p.title)
+                            .font(.system(size: 12, weight: .medium))
+                            .foregroundStyle(panel == p ? Theme.text : Theme.muted)
+                            .padding(.horizontal, 16)
+                            .frame(height: 26)
+                            .background(Capsule().fill(panel == p ? Theme.card : Color.clear))
+                            .overlay(Capsule().stroke(panel == p ? Theme.line : Color.clear))
+                            .contentShape(Capsule())
+                    }
+                    .buttonStyle(.plain)
+                }
+            }
+            .padding(3)
+            .background(Capsule().fill(Theme.line.opacity(0.5)))
+            .padding(.top, 30)
+
+            switch panel {
+            case .cli: CLIPanel()
+            case .desktop: DesktopPanel()
+            }
+        }
+        .frame(minWidth: 580, minHeight: 540)
+        .background(Theme.bg)
+    }
+}
+
+/** NoticeBar：底部提示条 */
+struct NoticeBar: View {
+    let text: String?
+
+    var body: some View {
+        if let text {
+            Text(text)
+                .font(.system(size: 12))
+                .foregroundStyle(Theme.muted)
+                .lineLimit(2)
+                .padding(.horizontal, 24)
+                .padding(.vertical, 12)
+                .frame(maxWidth: .infinity, alignment: .leading)
+                .overlay(alignment: .top) { Rectangle().fill(Theme.line).frame(height: 1) }
+                .transition(.opacity)
+        }
+    }
+}
+
+/** CLIPanel：命令行账号页 */
+struct CLIPanel: View {
     @EnvironmentObject var store: AccountStore
     @State private var showLogin = false
     @State private var pendingDelete: Profile?
@@ -14,7 +75,7 @@ struct ContentView: View {
         VStack(alignment: .leading, spacing: 0) {
             header
                 .padding(.horizontal, 24)
-                .padding(.top, 34)
+                .padding(.top, 18)
                 .padding(.bottom, 18)
 
             ScrollView {
@@ -26,7 +87,8 @@ struct ContentView: View {
                         emptyState
                     }
                     ForEach(store.profiles) { p in
-                        ProfileRow(profile: p,
+                        ProfileRow(title: p.email.isEmpty ? "未知账号" : p.email,
+                                   subtitle: subtitle(p),
                                    isCurrent: p.accountUuid == store.currentUuid,
                                    onSwitch: { withAnimation(.snappy) { store.switchTo(p) } },
                                    onDelete: { pendingDelete = p })
@@ -36,20 +98,8 @@ struct ContentView: View {
                 .padding(.bottom, 24)
             }
 
-            if let notice = store.notice {
-                Text(notice)
-                    .font(.system(size: 12))
-                    .foregroundStyle(Theme.muted)
-                    .lineLimit(2)
-                    .padding(.horizontal, 24)
-                    .padding(.vertical, 12)
-                    .frame(maxWidth: .infinity, alignment: .leading)
-                    .overlay(alignment: .top) { Rectangle().fill(Theme.line).frame(height: 1) }
-                    .transition(.opacity)
-            }
+            NoticeBar(text: store.notice)
         }
-        .frame(minWidth: 580, minHeight: 540)
-        .background(Theme.bg)
         .sheet(isPresented: $showLogin) { LoginSheet().environmentObject(store) }
         .alert("删除这个账号？", isPresented: Binding(get: { pendingDelete != nil },
                                                     set: { if !$0 { pendingDelete = nil } }),
@@ -91,6 +141,11 @@ struct ContentView: View {
         }
     }
 
+    private func subtitle(_ p: Profile) -> String {
+        let plan = p.plan.isEmpty ? "" : p.plan.prefix(1).uppercased() + p.plan.dropFirst()
+        return [p.orgName, plan].filter { !$0.isEmpty }.joined(separator: " · ")
+    }
+
     private func unsavedBanner(_ email: String) -> some View {
         HStack(spacing: 12) {
             Icon.download.image(16).foregroundStyle(Theme.accent)
@@ -118,8 +173,10 @@ struct ContentView: View {
 
 /** ProfileRow：一行账号卡片 */
 struct ProfileRow: View {
-    let profile: Profile
+    let title: String
+    let subtitle: String
     let isCurrent: Bool
+    var disabled = false
     let onSwitch: () -> Void
     let onDelete: () -> Void
     @State private var hover = false
@@ -128,7 +185,7 @@ struct ProfileRow: View {
         HStack(spacing: 14) {
             avatar
             VStack(alignment: .leading, spacing: 3) {
-                Text(profile.email.isEmpty ? "未知账号" : profile.email)
+                Text(title)
                     .font(.system(size: 14, weight: .semibold))
                     .foregroundStyle(Theme.text)
                     .lineLimit(1)
@@ -156,6 +213,7 @@ struct ProfileRow: View {
                     }
                 }
                 .buttonStyle(PillButton(filled: false))
+                .disabled(disabled)
             }
 
             Button(action: onDelete) {
@@ -176,15 +234,10 @@ struct ProfileRow: View {
         .onHover { h in withAnimation(.easeOut(duration: 0.15)) { hover = h } }
     }
 
-    private var subtitle: String {
-        let plan = profile.plan.isEmpty ? "" : profile.plan.prefix(1).uppercased() + profile.plan.dropFirst()
-        return [profile.orgName, plan].filter { !$0.isEmpty }.joined(separator: " · ")
-    }
-
     private var avatar: some View {
-        let seed = profile.email.unicodeScalars.reduce(0) { $0 &+ Int($1.value) }
+        let seed = title.unicodeScalars.reduce(0) { $0 &+ Int($1.value) }
         let color = Color(nsColor: NSColor(hex: Theme.avatarColors[abs(seed) % Theme.avatarColors.count]))
-        return Text(profile.email.first.map { String($0).uppercased() } ?? "?")
+        return Text(title.first.map { String($0).uppercased() } ?? "?")
             .font(.system(size: 15, weight: .semibold))
             .foregroundStyle(.white)
             .frame(width: 38, height: 38)
