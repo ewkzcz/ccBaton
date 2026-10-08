@@ -12,6 +12,7 @@ struct DesktopPanel: View {
     @State private var naming: NameRequest?
     @State private var nameInput = ""
     @State private var pendingDelete: DesktopProfile?
+    @State private var showSync = false
 
     /** NameRequest：保存或改名时要填的名字 */
     private struct NameRequest: Identifiable {
@@ -92,6 +93,7 @@ struct DesktopPanel: View {
                  ? "\(displayName(p)) 正在使用，删除后桌面端仍保持登录。"
                  : "删除 \(displayName(p)) 保存的登录信息。")
         }
+        .sheet(isPresented: $showSync) { SessionSyncSheet(name: accountName).environmentObject(desktop) }
         .onAppear { desktop.refresh() }
         .onReceive(NotificationCenter.default.publisher(for: NSApplication.didBecomeActiveNotification)) { _ in
             desktop.refresh()
@@ -109,6 +111,14 @@ struct DesktopPanel: View {
                     .foregroundStyle(Theme.muted)
             }
             Spacer()
+            Button { showSync = true } label: {
+                HStack(spacing: 5) {
+                    Icon.swap.image(12)
+                    Text("同步会话")
+                }
+            }
+            .buttonStyle(PillButton(filled: false))
+            .disabled(desktop.busy || !desktop.installed)
             Button { confirmLogin = true } label: {
                 HStack(spacing: 6) {
                     if desktop.busy { ProgressView().controlSize(.small).tint(.white) } else { Icon.plus.image(14) }
@@ -133,6 +143,12 @@ struct DesktopPanel: View {
     private func displayName(_ p: DesktopProfile) -> String {
         if !p.name.isEmpty { return p.name }
         return cliEmail(p.accountUuid) ?? "桌面账号 \(p.accountUuid.prefix(8))"
+    }
+
+    /** 按账号 ID 取显示名：保存过的用它的名字，否则用命令行里的邮箱或账号 ID 前缀 */
+    private func accountName(_ uuid: String) -> String {
+        if let p = desktop.profiles.first(where: { $0.accountUuid == uuid }) { return displayName(p) }
+        return cliEmail(uuid) ?? "账号 \(uuid.prefix(8))"
     }
 
     private func cliEmail(_ uuid: String) -> String? {

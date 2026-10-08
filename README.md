@@ -27,7 +27,8 @@ Claude 桌面端不读上面两处，它的登录状态在 `~/Library/Applicatio
 
 - **保存 / 切换 / 添加**：都会先退出桌面端（它运行时会把旧状态写回去），操作完再自动重开。
 - **切换前回存**：先把当前账号的最新状态存回它的快照；当前账号没保存过时，备份到 `desktop/last-backup`。
-- **会话共享**：桌面端 Code 标签页的会话索引按账号存在 `claude-code-sessions/<账号ID>/<组织ID>/` 下，对话记录本身在 `~/.claude/projects`，本来就是共用的。ccBaton 在桌面端没运行时，以及每次保存、切换时，会扫描这些目录，把每个 `<账号ID>/<组织ID>` 的内容并入 `claude-code-sessions/.ccbaton-shared/`，再把原目录换成指向它的软链接。新会话、新账号、新电脑都自动按这个规则处理；同名文件保留较新的一份。
+- **会话同步**：桌面端 Code 标签页的会话索引按账号存在 `claude-code-sessions/<账号ID>/<组织ID>/` 下（每个会话一个 `local_<ID>.json`，删除后留下 `deleted_<ID>` 标记），对话记录本身在 `~/.claude/projects`，本来就是共用的。每次切换、保存、添加账号，以及桌面端没运行时，ccBaton 会把所有账号的会话索引互相复制一遍：同一个会话保留较新的一份，在任一账号删掉的会话其他账号也删掉。也可以点“同步会话”，把指定账号的会话同步给指定的其他账号，或者关掉自动同步。
+- **旧版修复**：旧版用软链接共享会话目录，桌面端读得到但写不进去（`ENOTDIR`），那段时间新建的会话没存下来。新版第一次运行会把软链接换回真实目录，旧共享目录移到 `desktop/sessions-backup/`，并从对话记录里找回这期间桌面端新建的会话。
 
 
 
@@ -40,6 +41,7 @@ Claude 桌面端不读上面两处，它的登录状态在 `~/Library/Applicatio
 | 切换 | 点账号即切换，当前在用的账号会标出来 |
 | 删除 | 只删本应用存的凭据，不会让命令行退出登录 |
 | 会话共享 | 各账号共用会话记录和配置，切换后可以继续之前的会话 |
+| 同步会话 | 桌面端页的“同步会话”：把指定账号的会话同步给指定账号，开关自动同步 |
 | 桌面端 | 顶部切到“桌面端”页，单独管理 Claude 桌面端的账号，右键可改名 |
 
 数据存放位置：
@@ -49,7 +51,7 @@ Claude 桌面端不读上面两处，它的登录状态在 `~/Library/Applicatio
 | 钥匙串 `ccBaton-<id>` | 每个账号的登录凭据 |
 | `~/Library/Application Support/ccBaton/profiles.json` | 账号列表 |
 | `~/Library/Application Support/ccBaton/claude.json.bak` | 最近一次切换前的 `~/.claude.json` 备份 |
-| `~/Library/Application Support/ccBaton/desktop/` | 桌面端账号列表和每个账号的登录快照 |
+| `~/Library/Application Support/ccBaton/desktop/` | 桌面端账号列表、每个账号的登录快照，以及 `sessions-backup/` 旧版共享目录备份 |
 
 
 

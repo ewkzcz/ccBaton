@@ -23,6 +23,10 @@ final class DesktopStore: ObservableObject {
     @Published private(set) var running = false
     @Published private(set) var busy = false
     @Published var notice: String?
+    /** 切换、保存、登录账号时，以及桌面端没运行时，让所有账号的会话互相同步 */
+    @Published var autoSync: Bool {
+        didSet { UserDefaults.standard.set(autoSync, forKey: Self.autoSyncKey) }
+    }
 
     static let bundleID = "com.anthropic.claudefordesktop"
 
@@ -31,13 +35,13 @@ final class DesktopStore: ObservableObject {
     /** config.json 里随账号走的字段：oauth: 开头的令牌缓存，加上最后登录的账号 */
     private static let accountKey = "lastKnownAccountUuid"
     private static func isAuthKey(_ k: String) -> Bool { k.hasPrefix("oauth:") || k == accountKey }
+    private static let autoSyncKey = "desktop.autoSyncSessions"
 
     private let dataDir: URL
     private let configURL: URL
     private let rootDir: URL
     private let listURL: URL
-    private let sessionsDir: URL
-    private let sharedDir: URL
+    private let sessions: SessionSync
 
     /** 当前登录的账号是否已保存 */
     var currentSaved: Bool {
@@ -55,8 +59,12 @@ final class DesktopStore: ObservableObject {
         configURL = dataDir.appendingPathComponent("config.json")
         rootDir = support.appendingPathComponent("ccBaton/desktop", isDirectory: true)
         listURL = rootDir.appendingPathComponent("profiles.json")
-        sessionsDir = dataDir.appendingPathComponent("claude-code-sessions", isDirectory: true)
-        sharedDir = sessionsDir.appendingPathComponent(".ccbaton-shared", isDirectory: true)
+        let sessionsDir = dataDir.appendingPathComponent("claude-code-sessions", isDirectory: true)
+        sessions = SessionSync(root: sessionsDir,
+                               legacy: sessionsDir.appendingPathComponent(".ccbaton-shared", isDirectory: true),
+                               backupDir: rootDir.appendingPathComponent("sessions-backup", isDirectory: true),
+                               projectsDir: fm.homeDirectoryForCurrentUser.appendingPathComponent(".claude/projects"))
+        autoSync = UserDefaults.standard.object(forKey: Self.autoSyncKey) as? Bool ?? true
         try? fm.createDirectory(at: rootDir, withIntermediateDirectories: true,
                                 attributes: [.posixPermissions: 0o700])
         load()
@@ -68,7 +76,10 @@ final class DesktopStore: ObservableObject {
     /** 刷新当前账号和运行状态：有令牌缓存才算已登录 */
     func refresh() {
         running = Self.runningApp() != nil
-        if !running { linkSessions() }
+        if !running {
+            let repaired = syncSessions()
+            if !repaired.isEmpty { notice = String(repaired.dropFirst()) }
+        }
         let config = readConfig()
         let loggedIn = config?.keys.contains { $0.hasPrefix("oauth:") } ?? false
         currentUuid = loggedIn ? config?[Self.accountKey] as? String : nil
@@ -82,7 +93,7 @@ final class DesktopStore: ObservableObject {
      * 处理流程：
      * 1、退出桌面端，保证文件不再被写
      * 2、按账号 ID 查找已有记录，没有就新建
-     * 3、拍快照并落盘，再按原样重新打开桌面端
+     * 3、同步会话，拍快照并落盘，再按原样重新打开桌面端
      */
     func importCurrent(name: String) async {
         guard let uuid = currentUuid else {
@@ -99,12 +110,12 @@ final class DesktopStore: ObservableObject {
             let trimmed = name.trimmingCharacters(in: .whitespaces)
             if !trimmed.isEmpty { p.name = trimmed }
 
-            // 3、拍快照并落盘，再按原样重新打开桌面端
-            linkSessions()
+            // 3、同步会话，拍快照并落盘，再按原样重新打开桌面端
+            let repaired = syncSessions()
             if snapshot(to: dir(p)) {
                 if let i = profiles.firstIndex(where: { $0.id == p.id }) { profiles[i] = p } else { profiles.append(p) }
                 save()
-                notice = "已保存 \(p.name)"
+                notice = "已保存 \(p.name)" + repaired
             } else {
                 notice = "保存失败，桌面端的数据没有读全"
             }
@@ -118,7 +129,7 @@ final class DesktopStore: ObservableObject {
      * 处理流程：
      * 1、退出桌面端
      * 2、回存当前账号；没保存过的账号也留一份备份，防止丢失
-     * 3、写入目标账号的快照，再打开桌面端
+     * 3、同步各账号的会话，写入目标账号的快照，再打开桌面端
      */
     func switchTo(_ p: DesktopProfile) async {
         await perform {
@@ -128,14 +139,14 @@ final class DesktopStore: ObservableObject {
             // 2、回存当前账号；没保存过的账号也留一份备份，防止丢失
             backupCurrent()
 
-            // 3、写入目标账号的快照，再打开桌面端
-            linkSessions()
+            // 3、同步各账号的会话，写入目标账号的快照，再打开桌面端
+            let repaired = syncSessions()
             guard restore(from: dir(p)) else {
                 notice = "找不到 \(p.name) 的登录信息，请重新添加"
                 return
             }
             launchClaude()
-            notice = "已切换到 \(p.name)"
+            notice = "已切换到 \(p.name)" + repaired
         }
     }
 
@@ -143,22 +154,23 @@ final class DesktopStore: ObservableObject {
      * 登录新账号：保存好当前账号后清空登录状态，打开桌面端让用户登录
      *
      * 处理流程：
-     * 1、退出桌面端，回存当前账号
+     * 1、退出桌面端，回存当前账号，同步会话
      * 2、清掉登录相关的文件和字段
      * 3、打开桌面端，登录后回到本窗口保存
      */
     func startNewLogin() async {
         await perform {
-            // 1、退出桌面端，回存当前账号
+            // 1、退出桌面端，回存当前账号，同步会话
             guard await quitClaude() != nil else { return }
             backupCurrent()
+            let repaired = syncSessions()
 
             // 2、清掉登录相关的文件和字段
             clearAuth()
 
             // 3、打开桌面端，登录后回到本窗口保存
             launchClaude()
-            notice = "请在桌面端登录新账号，完成后回到这里保存"
+            notice = "请在桌面端登录新账号，完成后回到这里保存" + repaired
         }
     }
 
@@ -200,78 +212,51 @@ final class DesktopStore: ObservableObject {
         }
     }
 
-    // MARK: - 会话共享
+    // MARK: - 会话同步
+
+    /** 列出有会话目录的账号，给手动同步选择 */
+    func sessionAccounts() -> [SessionSync.SessionAccount] { sessions.accounts() }
 
     /**
-     * 让所有账号共用同一份会话列表
-     *
-     * 桌面端把 Code 会话的索引存在 claude-code-sessions/<账号ID>/<组织ID>/ 下，对话记录本身在 ~/.claude/projects 里，
-     * 已经是共用的。这里把每个 <账号ID>/<组织ID> 目录换成指向同一个共享目录的软链接，新账号、新组织、新电脑都按同样的规则处理。
-     * 只在桌面端没运行时调用，避免它写到一半的文件被搬走。
+     * 把指定账号的会话同步给其他指定账号
      *
      * 处理流程：
-     * 1、确保共享目录存在
-     * 2、遍历每个账号下的每个组织目录，已经是软链接的跳过
-     * 3、把真实目录里的内容并入共享目录，再换成软链接
+     * 1、退出桌面端，保证会话文件不再被写
+     * 2、修复旧版软链接，再按选择同步
+     * 3、按原样重新打开桌面端
      */
-    private func linkSessions() {
-        // 1、确保共享目录存在
-        let fm = FileManager.default
-        guard fm.fileExists(atPath: sessionsDir.path) else { return }
-        try? fm.createDirectory(at: sharedDir, withIntermediateDirectories: true, attributes: [.posixPermissions: 0o700])
+    func syncSessions(from source: String, to targets: [String]) async {
+        await perform {
+            // 1、退出桌面端，保证会话文件不再被写
+            guard let wasRunning = await quitClaude() else { return }
 
-        // 2、遍历每个账号下的每个组织目录，已经是软链接的跳过
-        for account in subdirs(sessionsDir) where !account.lastPathComponent.hasPrefix(".") {
-            for org in (try? fm.contentsOfDirectory(at: account, includingPropertiesForKeys: nil)) ?? [] {
-                guard !Self.isSymlink(org), Self.isDirectory(org) else { continue }
+            // 2、修复旧版软链接，再按选择同步
+            let recovered = sessions.repairLegacyLinks()
+            let changed = sessions.sync(from: source, to: targets)
+            notice = "会话已同步到 \(targets.count) 个账号，更新了 \(changed) 个文件" + recoveredText(recovered)
 
-                // 3、把真实目录里的内容并入共享目录，再换成软链接
-                guard merge(org, into: sharedDir) else { continue }
-                try? fm.removeItem(at: org)
-                try? fm.createSymbolicLink(at: org, withDestinationURL: sharedDir)
-            }
+            // 3、按原样重新打开桌面端
+            if wasRunning { launchClaude() }
         }
     }
 
     /**
-     * 把 src 目录的内容并入 dest，成功后 src 可以删除
+     * 自动同步：修复旧版软链接，开着自动同步时让所有账号互相同步
      *
-     * 同名子目录递归合并；同名文件保留修改时间较新的一份。
+     * 只在桌面端没运行时调用，避免它写到一半的文件被覆盖。
+     *
+     * 返回值：修复了旧版软链接时返回给用户的说明，否则为空
      */
-    private func merge(_ src: URL, into dest: URL) -> Bool {
-        let fm = FileManager.default
-        guard let items = try? fm.contentsOfDirectory(at: src, includingPropertiesForKeys: nil) else { return false }
-        for item in items {
-            let target = dest.appendingPathComponent(item.lastPathComponent)
-            let exists = fm.fileExists(atPath: target.path)
-            if Self.isDirectory(item) && !Self.isSymlink(item) {
-                if !exists { try? fm.createDirectory(at: target, withIntermediateDirectories: true) }
-                guard merge(item, into: target) else { return false }
-            } else if !exists {
-                guard (try? fm.moveItem(at: item, to: target)) != nil else { return false }
-            } else if Self.mtime(item) > Self.mtime(target) {
-                guard (try? fm.replaceItemAt(target, withItemAt: item)) != nil else { return false }
-            }
-        }
-        return true
+    @discardableResult
+    private func syncSessions() -> String {
+        let recovered = sessions.repairLegacyLinks()
+        if autoSync { sessions.syncAll() }
+        return recovered == nil ? "" : "；已修复会话目录" + recoveredText(recovered)
     }
 
-    private func subdirs(_ url: URL) -> [URL] {
-        ((try? FileManager.default.contentsOfDirectory(at: url, includingPropertiesForKeys: nil)) ?? [])
-            .filter { Self.isDirectory($0) && !Self.isSymlink($0) }
-    }
-
-    private static func isSymlink(_ url: URL) -> Bool {
-        (try? url.resourceValues(forKeys: [.isSymbolicLinkKey]))?.isSymbolicLink ?? false
-    }
-
-    private static func isDirectory(_ url: URL) -> Bool {
-        var dir: ObjCBool = false
-        return FileManager.default.fileExists(atPath: url.path, isDirectory: &dir) && dir.boolValue
-    }
-
-    private static func mtime(_ url: URL) -> Date {
-        (try? url.resourceValues(forKeys: [.contentModificationDateKey]))?.contentModificationDate ?? .distantPast
+    private func recoveredText(_ recovered: Int?) -> String {
+        guard let recovered, recovered > 0 else { return "" }
+        return "，找回了 \(recovered) 个之前没保存下来的会话"
     }
 
     // MARK: - 桌面端进程
