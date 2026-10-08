@@ -25,8 +25,10 @@ struct SessionSync {
     let legacy: URL
     /** 旧版共享目录移到这里备份 */
     let backupDir: URL
-    /** 命令行的对话记录目录，用来恢复丢失的会话 */
+    /** 命令行的对话记录目录，用来恢复丢失的会话和导入命令行会话 */
     let projectsDir: URL
+    /** 已导入过的命令行会话 ID 列表 */
+    let imported: URL
 
     private static let indexPrefix = "local_"
     private static let tombPrefix = "deleted_"
@@ -166,23 +168,57 @@ struct SessionSync {
 
     // MARK: - 恢复丢失的会话
 
+    /** 为 since 之后在桌面端新建、但没有索引的会话补写索引，返回恢复的会话数 */
+    func recover(since: Date) -> Int {
+        addIndexes(modifiedSince: since) { info in
+            info.fromDesktop && (info.createdAt.map { $0 >= since } ?? false)
+        }.count
+    }
+
+    // MARK: - 导入命令行会话
+
     /**
-     * 为 since 之后在桌面端新建、但没有索引的会话补写索引
+     * 把命令行新建的会话导入桌面端，所有账号都能在会话列表里看到并继续
+     *
+     * 导入过的会话记在 imported 文件里，之后在桌面端删掉也不会再被导回来。
+     * SDK 和自动化脚本跑出来的会话不导入。
+     *
+     * 返回值：导入的会话数
+     */
+    @discardableResult
+    func importCLI() -> Int {
+        let handled = Set((try? Data(contentsOf: imported))
+            .flatMap { try? JSONSerialization.jsonObject(with: $0) } as? [String] ?? [])
+        let added = addIndexes(skipping: handled) { $0.entrypoint == "cli" }
+        guard !added.isEmpty else { return 0 }
+        if let data = try? JSONSerialization.data(withJSONObject: handled.union(added).sorted(),
+                                                  options: [.prettyPrinted]) {
+            try? data.write(to: imported, options: .atomic)
+        }
+        return added.count
+    }
+
+    // MARK: - 补写索引
+
+    /**
+     * 为没有索引的对话记录补写索引
      *
      * 处理流程：
      * 1、收集已有索引引用的对话记录，取最新的一份索引做模板
-     * 2、遍历 since 之后改动过的对话记录，跳过已有索引的
-     * 3、读出标题、目录、时间等信息，只恢复桌面端在 since 之后新建的会话
+     * 2、遍历对话记录，跳过已有索引、已处理过、时间太早的
+     * 3、先读开头判断来源（开头读不到来源就读全文），符合条件的再读全文取标题、目录、时间等信息
      * 4、生成索引写进每个会话目录
      *
-     * 返回值：恢复的会话数
+     * 参数：modifiedSince 只看这之后改动过的对话记录；skipping 跳过的会话 ID；accept 决定要不要补写
+     * 返回值：补写了索引的会话 ID
      */
-    func recover(since: Date) -> Int {
+    private func addIndexes(modifiedSince: Date = .distantPast, skipping: Set<String> = [],
+                            accept: (Transcript) -> Bool) -> [String] {
         // 1、收集已有索引引用的对话记录，取最新的一份索引做模板
         let slots = accounts().flatMap(\.slots)
-        guard !slots.isEmpty else { return 0 }
+        guard !slots.isEmpty else { return [] }
         let indexes = slots.flatMap(Self.children).filter { Self.indexID($0.lastPathComponent) != nil }
-        var known = Set<String>()
+        var known = skipping
         for file in indexes {
             guard let obj = Self.readJSON(file) else { continue }
             if let id = obj["cliSessionId"] as? String { known.insert(id) }
@@ -190,22 +226,23 @@ struct SessionSync {
         }
         let template = indexes.max { Self.mtime($0) < Self.mtime($1) }.flatMap(Self.readJSON) ?? [:]
 
-        // 2、遍历 since 之后改动过的对话记录，跳过已有索引的
-        var recovered = 0
+        // 2、遍历对话记录，跳过已有索引、已处理过、时间太早的
+        var added: [String] = []
         for project in Self.children(projectsDir) where Self.isDirectory(project) {
-            for file in Self.children(project) where file.pathExtension == "jsonl" && Self.mtime(file) >= since {
+            for file in Self.children(project) where file.pathExtension == "jsonl" {
                 let cliID = file.deletingPathExtension().lastPathComponent
-                guard !known.contains(cliID) else { continue }
+                guard !known.contains(cliID), Self.mtime(file) >= modifiedSince else { continue }
 
-                // 3、读出标题、目录、时间等信息，只恢复桌面端在 since 之后新建的会话
-                guard let info = Transcript(file), info.fromDesktop, info.hasPrompt,
-                      let created = info.createdAt, created >= since, let cwd = info.cwd else { continue }
+                // 3、先读开头判断来源（开头读不到来源就读全文），符合条件的再读全文取标题、目录、时间等信息
+                guard let head = Transcript(file, headOnly: true),
+                      head.entrypoint == nil || accept(head),
+                      let info = Transcript(file), info.hasPrompt, let cwd = info.cwd, accept(info) else { continue }
 
                 // 4、生成索引写进每个会话目录
                 let index = Self.makeIndex(cliID: cliID, cwd: cwd, info: info, template: template)
                 guard let data = try? JSONSerialization.data(withJSONObject: index, options: [.withoutEscapingSlashes]),
                       let sessionID = index["sessionId"] as? String else { continue }
-                let modified = info.lastActivityAt ?? created
+                let modified = info.lastActivityAt ?? info.createdAt ?? Date()
                 for slot in slots {
                     let dest = slot.appendingPathComponent("\(sessionID).json")
                     guard (try? data.write(to: dest, options: .atomic)) != nil else { continue }
@@ -213,10 +250,10 @@ struct SessionSync {
                                                            ofItemAtPath: dest.path)
                 }
                 known.insert(cliID)
-                recovered += 1
+                added.append(cliID)
             }
         }
-        return recovered
+        return added
     }
 
     /** 按桌面端的格式生成一份索引；提示词快照、MCP 配置这类环境字段沿用模板 */
@@ -231,7 +268,9 @@ struct SessionSync {
             "createdAt": ms(info.createdAt),
             "lastActivityAt": ms(info.lastActivityAt),
             "lastFocusedAt": ms(info.lastActivityAt),
-            "model": info.model ?? template["model"] as? String ?? "default",
+            // 命令行可能接了第三方模型，桌面端不认识，只沿用 Claude 模型
+            "model": info.model.flatMap { $0.hasPrefix("claude-") ? $0 : nil }
+                ?? template["model"] as? String ?? "default",
             "effort": template["effort"] as? String ?? "medium",
             "isArchived": false,
             "title": info.title,
@@ -301,6 +340,8 @@ struct SessionSync {
 
 /** Transcript：从一份对话记录里读出恢复索引需要的信息 */
 private struct Transcript {
+    /** 第一条记录的来源：cli、sdk-cli、claude-desktop */
+    var entrypoint: String?
     var fromDesktop = false
     var hasPrompt = false
     var cwd: String?
@@ -319,13 +360,19 @@ private struct Transcript {
         return line.count > 60 ? String(line.prefix(60)) + "…" : line
     }
 
-    init?(_ url: URL) {
-        guard let data = try? Data(contentsOf: url) else { return nil }
+    /** 读对话记录；headOnly 只读开头 64KB，用来快速判断来源 */
+    init?(_ url: URL, headOnly: Bool = false) {
+        let handle = try? FileHandle(forReadingFrom: url)
+        defer { try? handle?.close() }
+        guard let data = headOnly ? try? handle?.read(upToCount: 65536) : try? handle?.readToEnd() else { return nil }
         let iso = ISO8601DateFormatter()
         iso.formatOptions = [.withInternetDateTime, .withFractionalSeconds]
         for line in data.split(separator: UInt8(ascii: "\n")) {
             guard let obj = (try? JSONSerialization.jsonObject(with: Data(line))) as? [String: Any] else { continue }
-            if obj["entrypoint"] as? String == "claude-desktop" { fromDesktop = true }
+            if let ep = obj["entrypoint"] as? String {
+                if entrypoint == nil { entrypoint = ep }
+                if ep == "claude-desktop" { fromDesktop = true }
+            }
             if cwd == nil { cwd = obj["cwd"] as? String }
             if let ts = (obj["timestamp"] as? String).flatMap(iso.date(from:)) {
                 if createdAt == nil { createdAt = ts }

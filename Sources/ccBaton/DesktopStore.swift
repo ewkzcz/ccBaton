@@ -23,7 +23,7 @@ final class DesktopStore: ObservableObject {
     @Published private(set) var running = false
     @Published private(set) var busy = false
     @Published var notice: String?
-    /** 切换、保存、登录账号时，以及桌面端没运行时，让所有账号的会话互相同步 */
+    /** 切换、保存、登录账号时，以及桌面端没运行时，导入命令行会话并让所有账号的会话互相同步 */
     @Published var autoSync: Bool {
         didSet { UserDefaults.standard.set(autoSync, forKey: Self.autoSyncKey) }
     }
@@ -63,7 +63,8 @@ final class DesktopStore: ObservableObject {
         sessions = SessionSync(root: sessionsDir,
                                legacy: sessionsDir.appendingPathComponent(".ccbaton-shared", isDirectory: true),
                                backupDir: rootDir.appendingPathComponent("sessions-backup", isDirectory: true),
-                               projectsDir: fm.homeDirectoryForCurrentUser.appendingPathComponent(".claude/projects"))
+                               projectsDir: fm.homeDirectoryForCurrentUser.appendingPathComponent(".claude/projects"),
+                               imported: rootDir.appendingPathComponent("cli-imported.json"))
         autoSync = UserDefaults.standard.object(forKey: Self.autoSyncKey) as? Bool ?? true
         try? fm.createDirectory(at: rootDir, withIntermediateDirectories: true,
                                 attributes: [.posixPermissions: 0o700])
@@ -241,7 +242,40 @@ final class DesktopStore: ObservableObject {
     }
 
     /**
-     * 自动同步：修复旧版软链接，开着自动同步时让所有账号互相同步
+     * 把命令行新建的会话导入桌面端
+     *
+     * 处理流程：
+     * 1、退出桌面端，保证会话文件不再被写
+     * 2、修复旧版软链接，导入命令行会话；开着自动同步时再让所有账号互相同步
+     * 3、按原样重新打开桌面端
+     *
+     * 返回值：给用户看的结果说明
+     */
+    func importCLISessions() async -> String {
+        var result = ""
+        await perform {
+            // 1、退出桌面端，保证会话文件不再被写
+            guard let wasRunning = await quitClaude() else {
+                result = notice ?? ""
+                return
+            }
+
+            // 2、修复旧版软链接，导入命令行会话；开着自动同步时再让所有账号互相同步
+            let recovered = sessions.repairLegacyLinks()
+            let count = sessions.importCLI()
+            if autoSync { sessions.syncAll() }
+            result = (count > 0 ? "已把 \(count) 个命令行会话导入桌面端" : "没有新的命令行会话需要导入")
+                + recoveredText(recovered)
+            notice = result
+
+            // 3、按原样重新打开桌面端
+            if wasRunning { launchClaude() }
+        }
+        return result
+    }
+
+    /**
+     * 自动同步：修复旧版软链接，开着自动同步时导入命令行会话并让所有账号互相同步
      *
      * 只在桌面端没运行时调用，避免它写到一半的文件被覆盖。
      *
@@ -250,7 +284,10 @@ final class DesktopStore: ObservableObject {
     @discardableResult
     private func syncSessions() -> String {
         let recovered = sessions.repairLegacyLinks()
-        if autoSync { sessions.syncAll() }
+        if autoSync {
+            sessions.importCLI()
+            sessions.syncAll()
+        }
         return recovered == nil ? "" : "；已修复会话目录" + recoveredText(recovered)
     }
 

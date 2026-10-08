@@ -68,7 +68,9 @@ struct NoticeBar: View {
 /** CLIPanel：命令行账号页 */
 struct CLIPanel: View {
     @EnvironmentObject var store: AccountStore
+    @EnvironmentObject var desktop: DesktopStore
     @State private var showLogin = false
+    @State private var confirmImport = false
     @State private var pendingDelete: Profile?
 
     var body: some View {
@@ -90,7 +92,10 @@ struct CLIPanel: View {
                         ProfileRow(title: p.email.isEmpty ? "未知账号" : p.email,
                                    subtitle: subtitle(p),
                                    isCurrent: p.accountUuid == store.currentUuid,
-                                   onSwitch: { withAnimation(.snappy) { store.switchTo(p) } },
+                                   onSwitch: {
+                                       withAnimation(.snappy) { store.switchTo(p) }
+                                       desktop.refresh()
+                                   },
                                    onDelete: { pendingDelete = p })
                     }
                 }
@@ -101,6 +106,12 @@ struct CLIPanel: View {
             NoticeBar(text: store.notice)
         }
         .sheet(isPresented: $showLogin) { LoginSheet().environmentObject(store) }
+        .alert("把命令行会话同步到桌面端？", isPresented: $confirmImport) {
+            Button("同步") { Task { store.notice = await desktop.importCLISessions() } }
+            Button("取消", role: .cancel) {}
+        } message: {
+            Text("命令行新建的会话会出现在所有桌面端账号的会话列表里，可以直接继续。桌面端的会话本来就能用 claude --resume 打开。同步时会短暂退出 Claude 桌面端，完成后自动重开。")
+        }
         .alert("删除这个账号？", isPresented: Binding(get: { pendingDelete != nil },
                                                     set: { if !$0 { pendingDelete = nil } }),
                presenting: pendingDelete) { p in
@@ -127,6 +138,14 @@ struct CLIPanel: View {
                     .foregroundStyle(Theme.muted)
             }
             Spacer()
+            Button { confirmImport = true } label: {
+                HStack(spacing: 5) {
+                    Icon.swap.image(12)
+                    Text("同步到桌面端")
+                }
+            }
+            .buttonStyle(PillButton(filled: false))
+            .disabled(desktop.busy || !desktop.installed)
             Button { showLogin = true } label: {
                 HStack(spacing: 6) {
                     Icon.plus.image(14)
