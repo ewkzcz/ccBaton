@@ -41,7 +41,12 @@ final class DesktopStore: ObservableObject {
     private let configURL: URL
     private let rootDir: URL
     private let listURL: URL
-    private let sessions: SessionSync
+    private let allSessions: SessionSync
+
+    /** 会话同步只在已保存的账号和当前登录的账号之间进行 */
+    private var sessions: SessionSync {
+        allSessions.limited(to: Set(profiles.map(\.accountUuid) + [currentUuid].compactMap { $0 }))
+    }
 
     /** 当前登录的账号是否已保存 */
     var currentSaved: Bool {
@@ -60,7 +65,7 @@ final class DesktopStore: ObservableObject {
         rootDir = support.appendingPathComponent("ccBaton/desktop", isDirectory: true)
         listURL = rootDir.appendingPathComponent("profiles.json")
         let sessionsDir = dataDir.appendingPathComponent("claude-code-sessions", isDirectory: true)
-        sessions = SessionSync(root: sessionsDir,
+        allSessions = SessionSync(root: sessionsDir,
                                legacy: sessionsDir.appendingPathComponent(".ccbaton-shared", isDirectory: true),
                                backupDir: rootDir.appendingPathComponent("sessions-backup", isDirectory: true),
                                projectsDir: fm.homeDirectoryForCurrentUser.appendingPathComponent(".claude/projects"),
@@ -77,13 +82,13 @@ final class DesktopStore: ObservableObject {
     /** 刷新当前账号和运行状态：有令牌缓存才算已登录 */
     func refresh() {
         running = Self.runningApp() != nil
+        let config = readConfig()
+        let loggedIn = config?.keys.contains { $0.hasPrefix("oauth:") } ?? false
+        currentUuid = loggedIn ? config?[Self.accountKey] as? String : nil
         if !running {
             let repaired = syncSessions()
             if !repaired.isEmpty { notice = String(repaired.dropFirst()) }
         }
-        let config = readConfig()
-        let loggedIn = config?.keys.contains { $0.hasPrefix("oauth:") } ?? false
-        currentUuid = loggedIn ? config?[Self.accountKey] as? String : nil
     }
 
     // MARK: - 操作

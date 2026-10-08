@@ -29,16 +29,26 @@ struct SessionSync {
     let projectsDir: URL
     /** 已导入过的命令行会话 ID 列表 */
     let imported: URL
+    /** 只处理这些账号；目录里还留着已经不用的旧账号，不能把它们当成账号同步 */
+    var only: Set<String>? = nil
 
     private static let indexPrefix = "local_"
     private static let tombPrefix = "deleted_"
 
     // MARK: - 查询
 
+    /** 返回只处理指定账号的副本 */
+    func limited(to ids: Set<String>) -> SessionSync {
+        var copy = self
+        copy.only = ids
+        return copy
+    }
+
     /** 列出所有账号及其会话目录，按会话数从多到少排 */
     func accounts() -> [SessionAccount] {
         Self.children(root)
             .filter { !$0.lastPathComponent.hasPrefix(".") && Self.isDirectory($0) && !Self.isSymlink($0) }
+            .filter { only?.contains($0.lastPathComponent) ?? true }
             .map { account in
                 let slots = Self.children(account).filter { Self.isDirectory($0) }
                 let ids = Set(slots.flatMap { Self.children($0).compactMap { Self.indexID($0.lastPathComponent) } })
