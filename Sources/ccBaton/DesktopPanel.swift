@@ -8,190 +8,136 @@ import SwiftUI
 struct DesktopPanel: View {
     @EnvironmentObject var desktop: DesktopStore
     @EnvironmentObject var cli: AccountStore
-    @State private var confirmLogin = false
-    @State private var naming: NameRequest?
-    @State private var nameInput = ""
-    @State private var pendingDelete: DesktopProfile?
-    @State private var showSync = false
-
-    /** NameRequest：保存或改名时要填的名字 */
-    private struct NameRequest: Identifiable {
-        let id = UUID()
-        let profile: DesktopProfile?
-    }
+    @EnvironmentObject var dialogs: Dialogs
 
     var body: some View {
-        VStack(alignment: .leading, spacing: 0) {
-            header
-                .padding(.horizontal, 24)
-                .padding(.top, 18)
-                .padding(.bottom, 18)
+        VStack(spacing: 0) {
+            PageHeader(icon: nil, title: "Claude 桌面端", subtitle: "账号") {
+                if desktop.installed {
+                    Badge(text: desktop.running ? "运行中" : "未运行", tone: desktop.running ? .success : .neutral)
+                }
+            } actions: {
+                Button { confirmLogin() } label: {
+                    HStack(spacing: 6) {
+                        if desktop.busy {
+                            ProgressView().controlSize(.mini).tint(.white).frame(width: 14, height: 14)
+                        } else {
+                            Icon.plus.image(14)
+                        }
+                        Text("添加账号")
+                    }
+                }
+                .buttonStyle(SolidButton())
+                .disabled(desktop.busy || !desktop.installed)
+            }
 
             ScrollView {
-                VStack(spacing: 10) {
+                VStack(spacing: 8) {
                     if !desktop.installed {
-                        hint("没有找到 Claude 桌面端的数据，请先安装并打开一次")
+                        Notice(tone: .warning, title: "没有找到 Claude 桌面端的数据",
+                               detail: "请先安装 Claude 桌面端并打开一次")
+                            .padding(.bottom, 4)
                     }
                     if !desktop.currentSaved, let uuid = desktop.currentUuid {
-                        unsavedBanner(uuid)
+                        Notice(tone: .warning, title: "桌面端当前登录的账号还没保存",
+                               detail: desktop.cliEmail(uuid, cli: cli) ?? "账号 \(uuid.prefix(8))") {
+                            Button("保存") { ask(nil) }
+                                .buttonStyle(NeutralButton(compact: true))
+                                .disabled(desktop.busy)
+                        }
+                        .padding(.bottom, 4)
                     }
-                    if desktop.profiles.isEmpty && desktop.currentSaved {
-                        emptyState
+                    if desktop.profiles.isEmpty && desktop.currentSaved && desktop.installed {
+                        EmptyState(icon: .monitor, title: "还没有保存的桌面端账号",
+                                   detail: "先在桌面端登录，回到这里保存；或点右上角“添加账号”")
                     }
                     ForEach(desktop.profiles) { p in
-                        ProfileRow(title: displayName(p),
-                                   subtitle: "添加于 " + p.addedAt.formatted(date: .abbreviated, time: .omitted),
-                                   isCurrent: p.accountUuid == desktop.currentUuid,
-                                   disabled: desktop.busy,
-                                   onSwitch: { Task { await desktop.switchTo(p) } },
-                                   onDelete: { pendingDelete = p })
+                        AccountCard(title: desktop.displayName(p, cli: cli),
+                                    subtitle: "添加于 " + p.addedAt.formatted(date: .abbreviated, time: .omitted),
+                                    isCurrent: p.accountUuid == desktop.currentUuid,
+                                    disabled: desktop.busy,
+                                    onSwitch: { Task { await desktop.switchTo(p) } },
+                                    onRename: { ask(p) },
+                                    onDelete: { confirmDelete(p) })
                         .contextMenu {
                             Button("改名") { ask(p) }
                         }
                     }
                     if !desktop.profiles.isEmpty {
-                        hint("切换时会自动退出并重新打开 Claude 桌面端；右键账号可以改名")
+                        Text("切换时会自动退出并重新打开 Claude 桌面端")
+                            .font(.captionText)
+                            .foregroundStyle(Theme.text3)
+                            .frame(maxWidth: .infinity, alignment: .leading)
+                            .padding(.top, 8)
                     }
                 }
                 .padding(.horizontal, 24)
-                .padding(.bottom, 24)
+                .padding(.top, 16)
+                .padding(.bottom, 72)
             }
+        }
+        .onAppear { desktop.refresh() }
+    }
 
-            NoticeBar(text: desktop.notice)
-        }
-        .alert("登录新的桌面端账号？", isPresented: $confirmLogin) {
-            Button("继续") { Task { await desktop.startNewLogin() } }
-            Button("取消", role: .cancel) {}
-        } message: {
-            Text(desktop.currentSaved
-                 ? "会退出 Claude 桌面端并清空登录状态，然后重新打开让你登录。当前账号已保存，随时可以切回来。"
-                 : "当前账号还没保存，会先备份一份，但建议先点“保存”。之后退出桌面端并清空登录状态，重新打开让你登录。")
-        }
-        .alert(naming?.profile == nil ? "保存当前桌面端账号" : "改名",
-               isPresented: Binding(get: { naming != nil }, set: { if !$0 { naming = nil } }),
-               presenting: naming) { req in
-            TextField("名字，比如邮箱", text: $nameInput)
-            Button("确定") {
-                if let p = req.profile {
-                    desktop.rename(p, to: nameInput)
+    private func confirmLogin() {
+        dialogs.present(DialogSpec(
+            title: "登录新的桌面端账号？",
+            message: desktop.currentSaved
+                ? "会退出 Claude 桌面端并清空登录状态，然后重新打开让你登录。当前账号已保存，随时可以切回来。"
+                : "当前账号还没保存，会先备份一份，但建议先点“保存”。之后退出桌面端并清空登录状态，重新打开让你登录。",
+            confirm: "退出并登录") { _ in
+                Task { await desktop.startNewLogin() }
+            })
+    }
+
+    /** 保存当前账号（p 为空）或给已保存的账号改名 */
+    private func ask(_ p: DesktopProfile?) {
+        let initial = p.map { desktop.displayName($0, cli: cli) }
+            ?? desktop.currentUuid.flatMap { desktop.cliEmail($0, cli: cli) } ?? ""
+        dialogs.present(DialogSpec(
+            title: p == nil ? "保存当前桌面端账号" : "改名",
+            message: p == nil ? "保存时会短暂退出 Claude 桌面端，完成后自动重开。" : "",
+            confirm: p == nil ? "保存" : "改名",
+            input: initial,
+            placeholder: "名字，比如邮箱") { name in
+                if let p {
+                    desktop.rename(p, to: name)
                 } else {
-                    let name = nameInput
                     Task { await desktop.importCurrent(name: name) }
                 }
-            }
-            Button("取消", role: .cancel) {}
-        } message: { req in
-            Text(req.profile == nil ? "保存时会短暂退出 Claude 桌面端，完成后自动重开。" : "")
-        }
-        .alert("删除这个账号？", isPresented: Binding(get: { pendingDelete != nil },
-                                                    set: { if !$0 { pendingDelete = nil } }),
-               presenting: pendingDelete) { p in
-            Button("删除", role: .destructive) { withAnimation(.snappy) { desktop.remove(p) } }
-            Button("取消", role: .cancel) {}
-        } message: { p in
-            Text(p.accountUuid == desktop.currentUuid
-                 ? "\(displayName(p)) 正在使用，删除后桌面端仍保持登录。"
-                 : "删除 \(displayName(p)) 保存的登录信息。")
-        }
-        .sheet(isPresented: $showSync) { SessionSyncSheet(name: accountName).environmentObject(desktop) }
-        .onAppear { desktop.refresh() }
-        .onReceive(NotificationCenter.default.publisher(for: NSApplication.didBecomeActiveNotification)) { _ in
-            desktop.refresh()
-        }
+            })
     }
 
-    private var header: some View {
-        HStack(alignment: .firstTextBaseline) {
-            VStack(alignment: .leading, spacing: 4) {
-                Text("Claude 桌面端账号")
-                    .font(.system(size: 22, weight: .semibold))
-                    .foregroundStyle(Theme.text)
-                Text(status)
-                    .font(.system(size: 12))
-                    .foregroundStyle(Theme.muted)
-            }
-            Spacer()
-            Button { showSync = true } label: {
-                HStack(spacing: 5) {
-                    Icon.swap.image(12)
-                    Text("同步会话")
-                }
-            }
-            .buttonStyle(PillButton(filled: false))
-            .disabled(desktop.busy || !desktop.installed)
-            Button { confirmLogin = true } label: {
-                HStack(spacing: 6) {
-                    if desktop.busy { ProgressView().controlSize(.small).tint(.white) } else { Icon.plus.image(14) }
-                    Text("添加账号").font(.system(size: 13, weight: .medium))
-                }
-                .foregroundStyle(.white)
-                .padding(.horizontal, 14)
-                .frame(height: 32)
-                .background(Capsule().fill(Theme.accent))
-            }
-            .buttonStyle(.plain)
-            .disabled(desktop.busy || !desktop.installed)
-        }
+    private func confirmDelete(_ p: DesktopProfile) {
+        let name = desktop.displayName(p, cli: cli)
+        dialogs.present(DialogSpec(
+            title: "删除「\(name)」？",
+            message: p.accountUuid == desktop.currentUuid
+                ? "这个账号正在使用，删除后桌面端仍保持登录，只删除本应用保存的登录信息。"
+                : "删除本应用保存的登录信息，之后要用这个账号需要重新添加。",
+            confirm: "删除", destructive: true) { _ in
+                withAnimation(.snappy) { desktop.remove(p) }
+            })
     }
+}
 
-    private var status: String {
-        let count = desktop.profiles.isEmpty ? "还没有保存的账号" : "已保存 \(desktop.profiles.count) 个"
-        return count + (desktop.running ? " · 桌面端运行中" : " · 桌面端未运行")
-    }
-
+/** 账号显示名：桌面端页和会话同步页共用 */
+extension DesktopStore {
     /** 显示名：自己起的名字，其次是命令行里同一账号的邮箱，最后用账号 ID 前缀 */
-    private func displayName(_ p: DesktopProfile) -> String {
+    func displayName(_ p: DesktopProfile, cli: AccountStore) -> String {
         if !p.name.isEmpty { return p.name }
-        return cliEmail(p.accountUuid) ?? "桌面账号 \(p.accountUuid.prefix(8))"
+        return cliEmail(p.accountUuid, cli: cli) ?? "桌面账号 \(p.accountUuid.prefix(8))"
     }
 
     /** 按账号 ID 取显示名：保存过的用它的名字，否则用命令行里的邮箱或账号 ID 前缀 */
-    private func accountName(_ uuid: String) -> String {
-        if uuid == desktop.thirdPartyUuid { return "第三方会话" }
-        if let p = desktop.profiles.first(where: { $0.accountUuid == uuid }) { return displayName(p) }
-        return cliEmail(uuid) ?? "账号 \(uuid.prefix(8))"
+    func accountName(_ uuid: String, cli: AccountStore) -> String {
+        if uuid == thirdPartyUuid { return "第三方会话" }
+        if let p = profiles.first(where: { $0.accountUuid == uuid }) { return displayName(p, cli: cli) }
+        return cliEmail(uuid, cli: cli) ?? "账号 \(uuid.prefix(8))"
     }
 
-    private func cliEmail(_ uuid: String) -> String? {
+    func cliEmail(_ uuid: String, cli: AccountStore) -> String? {
         cli.profiles.first { $0.accountUuid == uuid && !$0.email.isEmpty }?.email
             ?? (cli.currentUuid == uuid ? cli.currentEmail : nil)
-    }
-
-    private func ask(_ p: DesktopProfile?) {
-        nameInput = p.map(displayName) ?? desktop.currentUuid.flatMap(cliEmail) ?? ""
-        naming = NameRequest(profile: p)
-    }
-
-    private func unsavedBanner(_ uuid: String) -> some View {
-        HStack(spacing: 12) {
-            Icon.download.image(16).foregroundStyle(Theme.accent)
-            VStack(alignment: .leading, spacing: 2) {
-                Text("桌面端当前登录的账号还没保存").font(.system(size: 13, weight: .medium)).foregroundStyle(Theme.text)
-                Text(cliEmail(uuid) ?? "账号 \(uuid.prefix(8))").font(.system(size: 12)).foregroundStyle(Theme.muted)
-            }
-            Spacer()
-            Button("保存") { ask(nil) }
-                .buttonStyle(PillButton(filled: true))
-                .disabled(desktop.busy)
-        }
-        .padding(14)
-        .background(RoundedRectangle(cornerRadius: Theme.radius, style: .continuous).fill(Theme.accentSoft))
-    }
-
-    private func hint(_ text: String) -> some View {
-        Text(text)
-            .font(.system(size: 12))
-            .foregroundStyle(Theme.muted)
-            .frame(maxWidth: .infinity, alignment: .leading)
-            .padding(.top, 4)
-    }
-
-    private var emptyState: some View {
-        VStack(spacing: 10) {
-            Icon.user.image(28).foregroundStyle(Theme.muted)
-            Text("先在桌面端登录，回到这里保存；或点右上角添加账号").font(.system(size: 13)).foregroundStyle(Theme.muted)
-        }
-        .frame(maxWidth: .infinity)
-        .padding(.vertical, 60)
     }
 }

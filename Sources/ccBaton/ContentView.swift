@@ -1,281 +1,442 @@
 /**
- * 主窗口：顶部切换命令行和桌面端两个页面，各自管理账号的添加、切换、删除和保存。
+ * 主窗口：左侧导航栏切换命令行、桌面端和会话同步三个页面，右侧是当前页面；底部 Toast 报告操作结果。
  */
 import AppKit
 import SwiftUI
 
 /** Panel：主窗口的页面 */
 enum Panel: String, CaseIterable {
-    case cli, desktop
+    case cli, desktop, sessions
 
-    var title: String { self == .cli ? "命令行" : "桌面端" }
+    var title: String {
+        switch self {
+        case .cli: return "Claude Code"
+        case .desktop: return "Claude 桌面端"
+        case .sessions: return "会话同步"
+        }
+    }
+
+    var icon: Icon {
+        switch self {
+        case .cli: return .terminal
+        case .desktop: return .monitor
+        case .sessions: return .history
+        }
+    }
 }
 
-/** ContentView：主界面 */
+/** ContentView：侧栏 + 内容区 */
 struct ContentView: View {
+    @EnvironmentObject var store: AccountStore
+    @EnvironmentObject var desktop: DesktopStore
+    @StateObject private var dialogs = Dialogs()
     @AppStorage("panel") private var panel: Panel = .cli
+    @AppStorage("appearance") private var appearance: Appearance = .system
+    @State private var toast: ToastItem?
+
+    /** ToastItem：一条提示，id 用来区分内容相同的两次提示 */
+    private struct ToastItem: Equatable {
+        let id = UUID()
+        let text: String
+    }
+
+    var body: some View {
+        HStack(spacing: 0) {
+            Sidebar(panel: $panel)
+                .zIndex(1)
+            Group {
+                switch panel {
+                case .cli: CLIPanel()
+                case .desktop: DesktopPanel()
+                case .sessions: SessionsPanel()
+                }
+            }
+            .frame(maxWidth: .infinity, maxHeight: .infinity)
+            .background(Theme.bgApp)
+            .overlay(alignment: .bottom) { toastView }
+        }
+        .overlay { DialogHost() }
+        .environmentObject(dialogs)
+        .ignoresSafeArea()
+        .frame(minWidth: 720, minHeight: 500)
+        .background(Theme.bgApp)
+        .onAppear { appearance.apply() }
+        .onChange(of: appearance) { _, a in a.apply() }
+        .onChange(of: store.notice) { _, text in show(text) { store.notice = nil } }
+        .onChange(of: desktop.notice) { _, text in show(text) { desktop.notice = nil } }
+        .onReceive(NotificationCenter.default.publisher(for: NSApplication.didBecomeActiveNotification)) { _ in
+            store.refresh()
+            desktop.refresh()
+        }
+    }
+
+    @ViewBuilder
+    private var toastView: some View {
+        if let toast {
+            Toast(text: toast.text) { withAnimation(.easeOut(duration: 0.2)) { self.toast = nil } }
+                .padding(.horizontal, 24)
+                .padding(.bottom, 20)
+                .transition(.move(edge: .bottom).combined(with: .opacity))
+                .task(id: toast.id) {
+                    // 进行中的提示等结果出来再换掉，其余按长短停留几秒
+                    let seconds = toast.text.hasSuffix("…") ? 30 : (toast.text.count > 24 ? 4 : 2.5)
+                    try? await Task.sleep(for: .seconds(seconds))
+                    withAnimation(.easeOut(duration: 0.2)) { if self.toast?.id == toast.id { self.toast = nil } }
+                }
+        }
+    }
+
+    /** 把 Store 发来的提示换成 Toast，再清空原提示，下次同样的内容也能再弹 */
+    private func show(_ text: String?, clear: @escaping () -> Void) {
+        guard let text, !text.isEmpty else { return }
+        withAnimation(.snappy(duration: 0.25)) { toast = ToastItem(text: text) }
+        DispatchQueue.main.async(execute: clear)
+    }
+}
+
+// MARK: - 侧栏
+
+/** Sidebar：宽 200（收起 72），顶部品牌 → 账号页 → 分隔线 → 工具页 */
+struct Sidebar: View {
+    @Binding var panel: Panel
+    @EnvironmentObject var store: AccountStore
+    @EnvironmentObject var desktop: DesktopStore
+    @AppStorage("sidebarCollapsed") private var collapsed = false
 
     var body: some View {
         VStack(spacing: 0) {
-            HStack(spacing: 4) {
-                ForEach(Panel.allCases, id: \.self) { p in
-                    Button { withAnimation(.snappy) { panel = p } } label: {
-                        Text(p.title)
-                            .font(.system(size: 12, weight: .medium))
-                            .foregroundStyle(panel == p ? Theme.text : Theme.muted)
-                            .padding(.horizontal, 16)
-                            .frame(height: 26)
-                            .background(Capsule().fill(panel == p ? Theme.card : Color.clear))
-                            .overlay(Capsule().stroke(panel == p ? Theme.line : Color.clear))
-                            .contentShape(Capsule())
+            topBar
+            VStack(spacing: 2) {
+                item(.cli, trailing: count(store.profiles.count), alert: store.currentEmail != nil && !store.currentSaved)
+                item(.desktop, trailing: count(desktop.profiles.count), alert: desktop.currentUuid != nil && !desktop.currentSaved)
+            }
+            .padding(.top, 2)
+
+            Rectangle().fill(Theme.border).frame(height: 1)
+                .padding(.horizontal, collapsed ? 18 : 16)
+                .padding(.vertical, 6)
+
+            item(.sessions, trailing: desktop.autoSync ? "自动" : nil, alert: false)
+            Spacer()
+            AppearancePicker(collapsed: collapsed)
+                .padding(.bottom, 12)
+        }
+        .frame(width: collapsed ? Theme.sidebarCollapsed : Theme.sidebarWidth)
+        .frame(maxHeight: .infinity)
+        .background(Theme.bgSidebar)
+        .background(WindowDragArea())
+        .overlay(alignment: .trailing) { Rectangle().fill(Theme.border).frame(width: 1) }
+    }
+
+    /** 顶部：展开时红绿灯下面一行放图标、名字和收起按钮；收起时只留按钮 */
+    @ViewBuilder
+    private var topBar: some View {
+        let toggle = IconButton(icon: collapsed ? .chevronsRight : .chevronsLeft,
+                                tip: collapsed ? "展开侧栏" : "收起侧栏",
+                                tipSide: .trailing) {
+            withAnimation(.snappy(duration: 0.2)) { collapsed.toggle() }
+        }
+        Color.clear.frame(height: collapsed ? 28 : 26)
+        if collapsed {
+            toggle.frame(height: 32).padding(.bottom, 8)
+        } else {
+            HStack(spacing: 8) {
+                Image(nsImage: NSApp.applicationIconImage)
+                    .resizable()
+                    .interpolation(.high)
+                    .frame(width: 22, height: 22)
+                Text("ccBaton").font(.system(size: 14, weight: .semibold)).foregroundStyle(Theme.text1)
+                Spacer(minLength: 4)
+                toggle
+            }
+            .padding(.leading, 14)
+            .padding(.trailing, 8)
+            .frame(height: 36)
+            .padding(.bottom, 8)
+        }
+    }
+
+    private func count(_ n: Int) -> String? { n > 0 ? "\(n)" : nil }
+
+    private func item(_ p: Panel, trailing: String?, alert: Bool) -> some View {
+        SidebarItem(panel: p, selected: panel == p, collapsed: collapsed, trailing: trailing, alert: alert) {
+            panel = p
+        }
+    }
+}
+
+/** AppearancePicker：侧栏底部的外观切换；展开时是三段的分段控件，收起时是一个轮换按钮 */
+private struct AppearancePicker: View {
+    let collapsed: Bool
+    @AppStorage("appearance") private var appearance: Appearance = .system
+    @Namespace private var indicator
+
+    var body: some View {
+        if collapsed {
+            IconButton(icon: appearance.icon, tip: "外观：\(appearance.title)", tipSide: .trailing) {
+                let all = Appearance.allCases
+                appearance = all[(all.firstIndex(of: appearance)! + 1) % all.count]
+            }
+        } else {
+            HStack(spacing: 0) {
+                ForEach(Appearance.allCases, id: \.self) { a in
+                    Button { withAnimation(.snappy(duration: 0.2)) { appearance = a } } label: {
+                        a.icon.image(14)
+                            .foregroundStyle(appearance == a ? Theme.text1 : Theme.text3)
+                            .frame(maxWidth: .infinity)
+                            .frame(height: 22)
+                            .background {
+                                if appearance == a {
+                                    RoundedRectangle(cornerRadius: 5, style: .continuous)
+                                        .fill(Theme.card)
+                                        .shadow(color: Theme.shadowSm, radius: 1, y: 1)
+                                        .matchedGeometryEffect(id: "selected", in: indicator)
+                                }
+                            }
+                            .contentShape(Rectangle())
                     }
                     .buttonStyle(.plain)
+                    .hoverTip(a.title, side: .top)
+                    .accessibilityLabel(a.title)
                 }
             }
             .padding(3)
-            .background(Capsule().fill(Theme.line.opacity(0.5)))
-            .padding(.top, 30)
-
-            switch panel {
-            case .cli: CLIPanel()
-            case .desktop: DesktopPanel()
-            }
+            .background(RoundedRectangle(cornerRadius: 8, style: .continuous).fill(Theme.bgSubtle))
+            .padding(.horizontal, 16)
         }
-        .frame(minWidth: 580, minHeight: 540)
-        .background(Theme.bg)
     }
 }
 
-/** NoticeBar：底部提示条 */
-struct NoticeBar: View {
-    let text: String?
+/** SidebarItem：侧栏一行，高 28、圆角 6，当前项 bg-selected；收起时只剩图标，名字由 HoverTip 报 */
+private struct SidebarItem: View {
+    let panel: Panel
+    let selected: Bool
+    let collapsed: Bool
+    let trailing: String?
+    let alert: Bool
+    let action: () -> Void
+    @State private var hover = false
 
     var body: some View {
-        if let text {
-            Text(text)
-                .font(.system(size: 12))
-                .foregroundStyle(Theme.muted)
-                .lineLimit(2)
-                .padding(.horizontal, 24)
-                .padding(.vertical, 12)
-                .frame(maxWidth: .infinity, alignment: .leading)
-                .overlay(alignment: .top) { Rectangle().fill(Theme.line).frame(height: 1) }
-                .transition(.opacity)
+        Button(action: action) {
+            Group {
+                if collapsed {
+                    glyph(size: 20)
+                        .overlay(alignment: .topTrailing) {
+                            if alert {
+                                Circle().fill(Theme.danger).frame(width: 8, height: 8)
+                                    .overlay(Circle().stroke(selected ? Theme.bgSelected : Theme.bgSidebar, lineWidth: 2))
+                                    .offset(x: 4, y: -3)
+                            }
+                        }
+                        .frame(width: 48, height: 32)
+                } else {
+                    HStack(spacing: 8) {
+                        glyph(size: 16)
+                        Text(panel.title)
+                            .font(.system(size: 13, weight: selected ? .medium : .regular))
+                            .foregroundStyle(Theme.text1)
+                            .lineLimit(1)
+                        Spacer(minLength: 4)
+                        if alert {
+                            Circle().fill(Theme.danger).frame(width: 6, height: 6)
+                        } else if let trailing {
+                            Text(trailing).font(.captionText).monospacedDigit().foregroundStyle(Theme.text3)
+                        }
+                    }
+                    .padding(.horizontal, 8)
+                    .frame(height: 28)
+                }
+            }
+            .background(RoundedRectangle(cornerRadius: Theme.rControl, style: .continuous)
+                .fill(selected ? Theme.bgSelected : (hover ? Theme.bgSubtle : Color.clear)))
+            .contentShape(Rectangle())
+        }
+        .buttonStyle(.plain)
+        .padding(.horizontal, collapsed ? 12 : 8)
+        .onHover { hover = $0 }
+        .hoverTip(collapsed ? tip : "", side: .trailing)
+        .accessibilityLabel(tip)
+    }
+
+    private var tip: String {
+        alert ? "\(panel.title) · 当前账号还没保存" : panel.title
+    }
+
+    /** 应用页用彩色小方块，工具页用线条图标 */
+    @ViewBuilder
+    private func glyph(size: CGFloat) -> some View {
+        switch panel {
+        case .cli, .desktop:
+            panel.icon.image(size * 0.62)
+                .foregroundStyle(.white)
+                .frame(width: size, height: size)
+                .background(RoundedRectangle(cornerRadius: size * 0.27, style: .continuous)
+                    .fill(Color(nsColor: NSColor(hex: panel == .cli ? 0xD97757 : 0x3F3F46))))
+        case .sessions:
+            panel.icon.image(size).foregroundStyle(selected ? Theme.text1 : Theme.text2)
         }
     }
 }
+
+// MARK: - 命令行页
 
 /** CLIPanel：命令行账号页 */
 struct CLIPanel: View {
     @EnvironmentObject var store: AccountStore
-    @EnvironmentObject var desktop: DesktopStore
-    @State private var showLogin = false
-    @State private var confirmImport = false
-    @State private var pendingDelete: Profile?
+    @EnvironmentObject var dialogs: Dialogs
+    @State private var adding = false
 
     var body: some View {
-        VStack(alignment: .leading, spacing: 0) {
-            header
-                .padding(.horizontal, 24)
-                .padding(.top, 18)
-                .padding(.bottom, 18)
+        if adding {
+            LoginPage { adding = false }
+        } else {
+            list
+        }
+    }
+
+    private var list: some View {
+        VStack(spacing: 0) {
+            PageHeader(icon: nil, title: "Claude Code", subtitle: "账号") {
+                EmptyView()
+            } actions: {
+                Button { adding = true } label: {
+                    HStack(spacing: 6) {
+                        Icon.plus.image(14)
+                        Text("添加账号")
+                    }
+                }
+                .buttonStyle(SolidButton())
+            }
 
             ScrollView {
-                VStack(spacing: 10) {
+                VStack(spacing: 8) {
                     if !store.currentSaved, let email = store.currentEmail {
-                        unsavedBanner(email)
+                        Notice(tone: .warning, title: "当前登录的账号还没保存", detail: email) {
+                            Button("保存") { withAnimation(.snappy) { store.importCurrent() } }
+                                .buttonStyle(NeutralButton(compact: true))
+                        }
+                        .padding(.bottom, 4)
                     }
                     if store.profiles.isEmpty && store.currentSaved {
-                        emptyState
+                        EmptyState(icon: .user, title: "还没有保存的账号",
+                                   detail: "点右上角“添加账号”，在内嵌终端里登录")
                     }
                     ForEach(store.profiles) { p in
-                        ProfileRow(title: p.email.isEmpty ? "未知账号" : p.email,
-                                   subtitle: subtitle(p),
-                                   isCurrent: p.accountUuid == store.currentUuid,
-                                   onSwitch: {
-                                       withAnimation(.snappy) { store.switchTo(p) }
-                                       desktop.refresh()
-                                   },
-                                   onDelete: { pendingDelete = p })
+                        AccountCard(title: p.email.isEmpty ? "未知账号" : p.email,
+                                    subtitle: p.orgName,
+                                    badge: plan(p),
+                                    isCurrent: p.accountUuid == store.currentUuid,
+                                    onSwitch: { withAnimation(.snappy) { store.switchTo(p) } },
+                                    onDelete: { confirmDelete(p) })
+                    }
+                    if !store.profiles.isEmpty {
+                        Text("切换后，已经打开的 Claude Code 需要重开才会用新账号；用 claude --resume 可以接着之前的会话")
+                            .font(.captionText)
+                            .foregroundStyle(Theme.text3)
+                            .frame(maxWidth: .infinity, alignment: .leading)
+                            .padding(.top, 8)
                     }
                 }
                 .padding(.horizontal, 24)
-                .padding(.bottom, 24)
+                .padding(.top, 16)
+                .padding(.bottom, 72)
             }
-
-            NoticeBar(text: store.notice)
-        }
-        .sheet(isPresented: $showLogin) { LoginSheet().environmentObject(store) }
-        .alert("把命令行会话同步到桌面端？", isPresented: $confirmImport) {
-            Button("同步") { Task { store.notice = await desktop.importCLISessions() } }
-            Button("取消", role: .cancel) {}
-        } message: {
-            Text("命令行新建的会话会出现在所有桌面端账号的会话列表里，可以直接继续。桌面端的会话本来就能用 claude --resume 打开。同步时会短暂退出 Claude 桌面端，完成后自动重开。")
-        }
-        .alert("删除这个账号？", isPresented: Binding(get: { pendingDelete != nil },
-                                                    set: { if !$0 { pendingDelete = nil } }),
-               presenting: pendingDelete) { p in
-            Button("删除", role: .destructive) { withAnimation(.snappy) { store.remove(p) } }
-            Button("取消", role: .cancel) {}
-        } message: { p in
-            Text(p.accountUuid == store.currentUuid
-                 ? "\(p.email) 正在使用，删除后命令行仍保持登录。"
-                 : "删除 \(p.email) 保存的登录信息。")
-        }
-        .onReceive(NotificationCenter.default.publisher(for: NSApplication.didBecomeActiveNotification)) { _ in
-            store.refresh()
         }
     }
 
-    private var header: some View {
-        HStack(alignment: .firstTextBaseline) {
-            VStack(alignment: .leading, spacing: 4) {
-                Text("Claude Code 账号")
-                    .font(.system(size: 22, weight: .semibold))
-                    .foregroundStyle(Theme.text)
-                Text(store.profiles.isEmpty ? "还没有保存的账号" : "已保存 \(store.profiles.count) 个")
-                    .font(.system(size: 12))
-                    .foregroundStyle(Theme.muted)
-            }
-            Spacer()
-            Button { confirmImport = true } label: {
-                HStack(spacing: 5) {
-                    Icon.swap.image(12)
-                    Text("同步到桌面端")
-                }
-            }
-            .buttonStyle(PillButton(filled: false))
-            .disabled(desktop.busy || !desktop.installed)
-            Button { showLogin = true } label: {
-                HStack(spacing: 6) {
-                    Icon.plus.image(14)
-                    Text("添加账号").font(.system(size: 13, weight: .medium))
-                }
-                .foregroundStyle(.white)
-                .padding(.horizontal, 14)
-                .frame(height: 32)
-                .background(Capsule().fill(Theme.accent))
-            }
-            .buttonStyle(.plain)
-        }
+    private func plan(_ p: Profile) -> String? {
+        p.plan.isEmpty ? nil : p.plan.prefix(1).uppercased() + p.plan.dropFirst()
     }
 
-    private func subtitle(_ p: Profile) -> String {
-        let plan = p.plan.isEmpty ? "" : p.plan.prefix(1).uppercased() + p.plan.dropFirst()
-        return [p.orgName, plan].filter { !$0.isEmpty }.joined(separator: " · ")
-    }
-
-    private func unsavedBanner(_ email: String) -> some View {
-        HStack(spacing: 12) {
-            Icon.download.image(16).foregroundStyle(Theme.accent)
-            VStack(alignment: .leading, spacing: 2) {
-                Text("当前登录的账号还没保存").font(.system(size: 13, weight: .medium)).foregroundStyle(Theme.text)
-                Text(email).font(.system(size: 12)).foregroundStyle(Theme.muted)
-            }
-            Spacer()
-            Button("保存") { withAnimation(.snappy) { store.importCurrent() } }
-                .buttonStyle(PillButton(filled: true))
-        }
-        .padding(14)
-        .background(RoundedRectangle(cornerRadius: Theme.radius, style: .continuous).fill(Theme.accentSoft))
-    }
-
-    private var emptyState: some View {
-        VStack(spacing: 10) {
-            Icon.user.image(28).foregroundStyle(Theme.muted)
-            Text("点右上角添加账号").font(.system(size: 13)).foregroundStyle(Theme.muted)
-        }
-        .frame(maxWidth: .infinity)
-        .padding(.vertical, 60)
+    private func confirmDelete(_ p: Profile) {
+        dialogs.present(DialogSpec(
+            title: "删除「\(p.email)」？",
+            message: p.accountUuid == store.currentUuid
+                ? "这个账号正在使用，删除后命令行仍保持登录，只删除本应用保存的登录信息。"
+                : "删除本应用保存的登录信息，之后要用这个账号需要重新添加。",
+            confirm: "删除", destructive: true) { _ in
+                withAnimation(.snappy) { store.remove(p) }
+            })
     }
 }
 
-/** ProfileRow：一行账号卡片 */
-struct ProfileRow: View {
+// MARK: - 账号卡片
+
+/** AccountCard：一张账号卡片，最小高 58、圆角 10；右侧操作只在悬停时出现，当前账号用直连色 soft 底 + 描边 */
+struct AccountCard: View {
     let title: String
     let subtitle: String
+    var badge: String?
     let isCurrent: Bool
     var disabled = false
     let onSwitch: () -> Void
+    var onRename: (() -> Void)?
     let onDelete: () -> Void
     @State private var hover = false
 
     var body: some View {
-        HStack(spacing: 14) {
+        HStack(spacing: 12) {
             avatar
-            VStack(alignment: .leading, spacing: 3) {
-                Text(title)
-                    .font(.system(size: 14, weight: .semibold))
-                    .foregroundStyle(Theme.text)
-                    .lineLimit(1)
-                Text(subtitle)
-                    .font(.system(size: 12))
-                    .foregroundStyle(Theme.muted)
-                    .lineLimit(1)
+            VStack(alignment: .leading, spacing: 2) {
+                HStack(spacing: 6) {
+                    Text(title)
+                        .font(.strong)
+                        .foregroundStyle(Theme.text1)
+                        .lineLimit(1)
+                        .truncationMode(.middle)
+                    if let badge { Badge(text: badge) }
+                }
+                if !subtitle.isEmpty {
+                    Text(subtitle)
+                        .font(.captionText)
+                        .foregroundStyle(Theme.text3)
+                        .lineLimit(1)
+                        .truncationMode(.middle)
+                }
             }
             Spacer(minLength: 8)
 
+            HStack(spacing: 2) {
+                if !isCurrent {
+                    IconButton(icon: .swap, tip: "切换到这个账号", action: onSwitch).disabled(disabled)
+                }
+                if let onRename {
+                    IconButton(icon: .pencil, tip: "改名", action: onRename).disabled(disabled)
+                }
+                IconButton(icon: .trash, tip: "删除", danger: true, action: onDelete)
+            }
+            .opacity(hover ? 1 : 0)
+
             if isCurrent {
-                HStack(spacing: 5) {
-                    Icon.check.image(12)
-                    Text("使用中").font(.system(size: 12, weight: .medium))
+                HStack(spacing: 6) {
+                    Circle().fill(Theme.directFill).frame(width: 6, height: 6)
+                    Text("使用中").font(.system(size: 13, weight: .medium))
                 }
-                .foregroundStyle(Theme.accent)
-                .padding(.horizontal, 10)
-                .frame(height: 26)
-                .background(Capsule().fill(Theme.accentSoft))
-            } else {
-                Button(action: onSwitch) {
-                    HStack(spacing: 5) {
-                        Icon.swap.image(12)
-                        Text("切换")
-                    }
-                }
-                .buttonStyle(PillButton(filled: false))
-                .disabled(disabled)
+                .foregroundStyle(Theme.directText)
+                .padding(.trailing, 4)
             }
-
-            Button(action: onDelete) {
-                Icon.trash.image(14)
-                    .foregroundStyle(hover ? Theme.danger : Theme.muted)
-                    .frame(width: 28, height: 28)
-                    .contentShape(Rectangle())
-            }
-            .buttonStyle(.plain)
-            .help("删除")
         }
-        .padding(.horizontal, 16)
-        .padding(.vertical, 14)
-        .background(RoundedRectangle(cornerRadius: Theme.radius, style: .continuous)
-            .fill(hover ? Theme.cardHover : Theme.card))
-        .overlay(RoundedRectangle(cornerRadius: Theme.radius, style: .continuous)
-            .stroke(isCurrent ? Theme.accent.opacity(0.55) : Theme.line, lineWidth: 1))
+        .padding(.horizontal, 12)
+        .padding(.vertical, 10)
+        .frame(minHeight: 58)
+        .background(RoundedRectangle(cornerRadius: Theme.rPanel, style: .continuous)
+            .fill(isCurrent ? Theme.directSoft : Theme.card))
+        .overlay(RoundedRectangle(cornerRadius: Theme.rPanel, style: .continuous)
+            .strokeBorder(isCurrent ? Theme.directBorder : (hover ? Theme.borderStrong : Theme.border)))
+        .shadow(color: hover && !isCurrent ? Theme.shadowSm : .clear, radius: 2, y: 1)
+        .contentShape(Rectangle())
         .onHover { h in withAnimation(.easeOut(duration: 0.15)) { hover = h } }
+        .zIndex(hover ? 1 : 0)
     }
 
+    /** 图标框固定白底深色字，深色主题里也不反色 */
     private var avatar: some View {
-        let seed = title.unicodeScalars.reduce(0) { $0 &+ Int($1.value) }
-        let color = Color(nsColor: NSColor(hex: Theme.avatarColors[abs(seed) % Theme.avatarColors.count]))
-        return Text(title.first.map { String($0).uppercased() } ?? "?")
-            .font(.system(size: 15, weight: .semibold))
-            .foregroundStyle(.white)
-            .frame(width: 38, height: 38)
-            .background(Circle().fill(color))
-    }
-}
-
-/** PillButton：胶囊按钮样式 */
-struct PillButton: ButtonStyle {
-    let filled: Bool
-
-    func makeBody(configuration: Configuration) -> some View {
-        configuration.label
-            .font(.system(size: 12, weight: .medium))
-            .foregroundStyle(filled ? Color.white : Theme.text)
-            .padding(.horizontal, 12)
-            .frame(height: 26)
-            .background(Capsule().fill(filled ? Theme.accent : Theme.bg))
-            .overlay(Capsule().stroke(filled ? Color.clear : Theme.line))
-            .opacity(configuration.isPressed ? 0.7 : 1)
+        Text(title.first.map { String($0).uppercased() } ?? "?")
+            .font(.system(size: 14, weight: .semibold))
+            .foregroundStyle(Color(nsColor: NSColor(hex: 0x18181B)))
+            .frame(width: 32, height: 32)
+            .background(RoundedRectangle(cornerRadius: 8, style: .continuous).fill(.white))
+            .overlay(RoundedRectangle(cornerRadius: 8, style: .continuous).strokeBorder(Theme.border))
     }
 }

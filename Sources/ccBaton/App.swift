@@ -21,6 +21,6 @@ struct CcBatonApp: App {
             ContentView().environmentObject(store).environmentObject(desktop)
         }
         .windowStyle(.hiddenTitleBar)
-        .defaultSize(width: 580, height: 600)
+        .defaultSize(width: 860, height: 600)
     }
 }

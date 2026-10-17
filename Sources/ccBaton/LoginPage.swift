@@ -1,5 +1,5 @@
 /**
- * 登录弹窗：内嵌终端，在独立配置目录里运行登录命令，登录成功后自动保存账号。
+ * 添加账号页：内嵌终端，在独立配置目录里运行登录命令，登录成功后自动保存账号。
  */
 import AppKit
 import SwiftTerm
@@ -58,58 +58,61 @@ struct TerminalHost: NSViewRepresentable {
     }
 }
 
-/** LoginSheet：添加账号的弹窗 */
-struct LoginSheet: View {
+/** LoginPage：添加账号的二级页，返回按钮 + 标题，下面是内嵌终端 */
+struct LoginPage: View {
     @EnvironmentObject var store: AccountStore
-    @Environment(\.dismiss) private var dismiss
+    let onClose: () -> Void
     @State private var environment: [String]?
     @State private var waitingProfile = 0
 
     private let timer = Timer.publish(every: 1.5, on: .main, in: .common).autoconnect()
 
     var body: some View {
-        VStack(alignment: .leading, spacing: 14) {
-            HStack(spacing: 10) {
-                Icon.terminal.image(18).foregroundStyle(Theme.accent)
-                VStack(alignment: .leading, spacing: 2) {
-                    Text("登录新账号").font(.system(size: 15, weight: .semibold)).foregroundStyle(Theme.text)
-                    Text("在下面完成登录，成功后会自动保存").font(.system(size: 12)).foregroundStyle(Theme.muted)
-                }
-                Spacer()
-                Button { close() } label: {
-                    Icon.close.image(14)
-                        .foregroundStyle(Theme.muted)
-                        .frame(width: 28, height: 28)
-                        .background(Circle().fill(Theme.card))
-                        .overlay(Circle().stroke(Theme.line))
-                }
-                .buttonStyle(.plain)
+        VStack(spacing: 0) {
+            PageHeader(title: "添加 Claude Code 账号") {
+                IconButton(icon: .arrowLeft, tip: "返回", size: 32, bordered: true) { close() }
+            } extra: {
+                EmptyView()
+            } actions: {
+                EmptyView()
             }
 
-            HStack(spacing: 8) {
-                ForEach(["claude", "/login", "claude auth login"], id: \.self) { CopyChip(text: $0) }
-            }
+            VStack(alignment: .leading, spacing: 12) {
+                Text("在下面的终端里登录，成功后会自动保存。终端用独立的配置目录，不影响当前登录。")
+                    .font(.bodyText)
+                    .foregroundStyle(Theme.text2)
 
-            Group {
-                if let environment {
-                    TerminalHost(environment: environment)
-                } else {
-                    Color(nsColor: Theme.termBg)
+                HStack(spacing: 8) {
+                    Text("常用命令").font(.captionText).foregroundStyle(Theme.text3)
+                    ForEach(["claude", "/login", "claude auth login"], id: \.self) { CopyChip(text: $0) }
                 }
+
+                Group {
+                    if let environment {
+                        TerminalHost(environment: environment)
+                    } else {
+                        Color(nsColor: Theme.termBg)
+                    }
+                }
+                .padding(10)
+                .background(Color(nsColor: Theme.termBg))
+                .clipShape(RoundedRectangle(cornerRadius: Theme.rPanel, style: .continuous))
             }
-            .padding(10)
-            .background(Color(nsColor: Theme.termBg))
-            .clipShape(RoundedRectangle(cornerRadius: 12, style: .continuous))
+            .padding(.horizontal, 24)
+            .padding(.vertical, 16)
 
             HStack(spacing: 8) {
                 ProgressView().controlSize(.small)
-                Text("等待登录完成").font(.system(size: 12)).foregroundStyle(Theme.muted)
+                Text("等待登录完成").font(.captionText).foregroundStyle(Theme.text3)
+                Spacer()
+                Button("取消") { close() }.buttonStyle(NeutralButton())
             }
+            .padding(.horizontal, 24)
+            .frame(height: 56)
+            .overlay(alignment: .top) { Rectangle().fill(Theme.border).frame(height: 1) }
         }
-        .padding(20)
-        .frame(width: 580, height: 500)
-        .background(Theme.bg)
         .onAppear(perform: start)
+        .onDisappear { store.resetLoginDir() }
         .onReceive(timer) { _ in poll() }
     }
 
@@ -141,7 +144,7 @@ struct LoginSheet: View {
      * 处理流程：
      * 1、读独立目录的凭据，没有就继续等
      * 2、账号信息稍晚写入，最多再等几轮
-     * 3、保存账号并关闭弹窗
+     * 3、保存账号并回到账号列表
      */
     private func poll() {
         // 1、读独立目录的凭据，没有就继续等
@@ -153,7 +156,7 @@ struct LoginSheet: View {
             return
         }
 
-        // 3、保存账号并关闭弹窗
+        // 3、保存账号并回到账号列表
         let known = store.profiles.map(\.accountUuid)
         if let p = store.upsert(credential: login.credential, oauth: login.oauth) {
             store.notice = known.contains(p.accountUuid) && !p.accountUuid.isEmpty
@@ -162,11 +165,11 @@ struct LoginSheet: View {
         close()
     }
 
-    /** 关闭弹窗并清理登录目录 */
+    /** 回到账号列表并清理登录目录 */
     private func close() {
         environment = nil
         store.resetLoginDir()
-        dismiss()
+        onClose()
     }
 }
 
@@ -174,6 +177,7 @@ struct LoginSheet: View {
 struct CopyChip: View {
     let text: String
     @State private var copied = false
+    @State private var hover = false
 
     var body: some View {
         Button {
@@ -185,17 +189,20 @@ struct CopyChip: View {
             }
         } label: {
             HStack(spacing: 6) {
-                Text(text).font(.system(size: 12, design: .monospaced))
+                Text(text).font(.mono)
                 (copied ? Icon.check : Icon.copy).image(12)
-                    .foregroundStyle(copied ? Theme.accent : Theme.muted)
+                    .foregroundStyle(copied ? Theme.success : Theme.text3)
             }
-            .foregroundStyle(Theme.text)
-            .padding(.horizontal, 10)
-            .frame(height: 26)
-            .background(Capsule().fill(Theme.card))
-            .overlay(Capsule().stroke(copied ? Theme.accent.opacity(0.6) : Theme.line))
+            .foregroundStyle(Theme.text1)
+            .padding(.horizontal, 8)
+            .frame(height: 24)
+            .background(RoundedRectangle(cornerRadius: Theme.rControl, style: .continuous)
+                .fill(hover ? Theme.bgSubtle : Theme.card))
+            .overlay(RoundedRectangle(cornerRadius: Theme.rControl, style: .continuous).strokeBorder(Theme.border))
+            .contentShape(Rectangle())
         }
-        .buttonStyle(.plain)
-        .help("复制")
+        .buttonStyle(PressScale())
+        .onHover { hover = $0 }
+        .hoverTip(copied ? "已复制" : "复制命令")
     }
 }
