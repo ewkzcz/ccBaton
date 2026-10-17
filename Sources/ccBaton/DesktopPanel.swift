@@ -147,6 +147,7 @@ struct DesktopPanel: View {
 
     /** 按账号 ID 取显示名：保存过的用它的名字，否则用命令行里的邮箱或账号 ID 前缀 */
     private func accountName(_ uuid: String) -> String {
+        if uuid == desktop.thirdPartyUuid { return "非 Pro 账号（中转站 / DeepSeek）" }
         if let p = desktop.profiles.first(where: { $0.accountUuid == uuid }) { return displayName(p) }
         return cliEmail(uuid) ?? "账号 \(uuid.prefix(8))"
     }

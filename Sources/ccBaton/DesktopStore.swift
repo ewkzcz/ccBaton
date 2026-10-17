@@ -20,6 +20,8 @@ struct DesktopProfile: Codable, Identifiable, Equatable {
 final class DesktopStore: ObservableObject {
     @Published private(set) var profiles: [DesktopProfile] = []
     @Published private(set) var currentUuid: String?
+    /** 非 Pro 账号（第三方推理模式，接中转站、DeepSeek 等）的账号 ID，没用过时为空 */
+    @Published private(set) var thirdPartyUuid: String?
     @Published private(set) var running = false
     @Published private(set) var busy = false
     @Published var notice: String?
@@ -39,13 +41,15 @@ final class DesktopStore: ObservableObject {
 
     private let dataDir: URL
     private let configURL: URL
+    /** 非 Pro 账号的 config.json，在 Claude-3p 目录下 */
+    private let thirdPartyConfigURL: URL
     private let rootDir: URL
     private let listURL: URL
     private let allSessions: SessionSync
 
-    /** 会话同步只在已保存的账号和当前登录的账号之间进行 */
+    /** 会话同步只在已保存的账号、当前登录的账号和非 Pro 账号之间进行 */
     private var sessions: SessionSync {
-        allSessions.limited(to: Set(profiles.map(\.accountUuid) + [currentUuid].compactMap { $0 }))
+        allSessions.limited(to: Set(profiles.map(\.accountUuid) + [currentUuid, thirdPartyUuid].compactMap { $0 }))
     }
 
     /** 当前登录的账号是否已保存 */
@@ -62,10 +66,13 @@ final class DesktopStore: ObservableObject {
         let support = fm.urls(for: .applicationSupportDirectory, in: .userDomainMask)[0]
         dataDir = support.appendingPathComponent("Claude", isDirectory: true)
         configURL = dataDir.appendingPathComponent("config.json")
+        let thirdPartyDir = support.appendingPathComponent("Claude-3p", isDirectory: true)
+        thirdPartyConfigURL = thirdPartyDir.appendingPathComponent("config.json")
         rootDir = support.appendingPathComponent("ccBaton/desktop", isDirectory: true)
         listURL = rootDir.appendingPathComponent("profiles.json")
         let sessionsDir = dataDir.appendingPathComponent("claude-code-sessions", isDirectory: true)
         allSessions = SessionSync(root: sessionsDir,
+                               thirdPartyRoot: thirdPartyDir.appendingPathComponent("claude-code-sessions", isDirectory: true),
                                legacy: sessionsDir.appendingPathComponent(".ccbaton-shared", isDirectory: true),
                                backupDir: rootDir.appendingPathComponent("sessions-backup", isDirectory: true),
                                projectsDir: fm.homeDirectoryForCurrentUser.appendingPathComponent(".claude/projects"),
@@ -79,12 +86,13 @@ final class DesktopStore: ObservableObject {
 
     // MARK: - 状态
 
-    /** 刷新当前账号和运行状态：有令牌缓存才算已登录 */
+    /** 刷新当前账号和运行状态：有令牌缓存才算已登录；非 Pro 账号没有令牌，按最后使用的账号算 */
     func refresh() {
         running = Self.runningApp() != nil
         let config = readConfig()
         let loggedIn = config?.keys.contains { $0.hasPrefix("oauth:") } ?? false
         currentUuid = loggedIn ? config?[Self.accountKey] as? String : nil
+        thirdPartyUuid = Self.readJSON(thirdPartyConfigURL)?[Self.accountKey] as? String
         if !running {
             let repaired = syncSessions()
             if !repaired.isEmpty { notice = String(repaired.dropFirst()) }
@@ -432,8 +440,10 @@ final class DesktopStore: ObservableObject {
         try? data.write(to: listURL, options: .atomic)
     }
 
-    private func readConfig() -> [String: Any]? {
-        guard let data = try? Data(contentsOf: configURL) else { return nil }
+    private func readConfig() -> [String: Any]? { Self.readJSON(configURL) }
+
+    private static func readJSON(_ url: URL) -> [String: Any]? {
+        guard let data = try? Data(contentsOf: url) else { return nil }
         return (try? JSONSerialization.jsonObject(with: data)) as? [String: Any]
     }
 

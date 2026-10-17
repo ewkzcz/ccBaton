@@ -19,7 +19,7 @@ struct SessionSyncSheet: View {
                 Icon.swap.image(18).foregroundStyle(Theme.accent)
                 VStack(alignment: .leading, spacing: 2) {
                     Text("同步会话").font(.system(size: 15, weight: .semibold)).foregroundStyle(Theme.text)
-                    Text("把一个账号的会话复制给其他账号，同一个会话保留较新的一份").font(.system(size: 12)).foregroundStyle(Theme.muted)
+                    Text("把一个账号的会话复制给其他账号，同一个会话保留较新的一份；非 Pro 账号也能同步和迁移").font(.system(size: 12)).foregroundStyle(Theme.muted)
                 }
                 Spacer()
                 Button { dismiss() } label: {
@@ -35,7 +35,7 @@ struct SessionSyncSheet: View {
             Toggle(isOn: $desktop.autoSync) {
                 VStack(alignment: .leading, spacing: 2) {
                     Text("所有账号自动同步").font(.system(size: 13, weight: .medium)).foregroundStyle(Theme.text)
-                    Text("每次切换、保存、添加账号时，所有账号的会话互相同步").font(.system(size: 12)).foregroundStyle(Theme.muted)
+                    Text("每次切换、保存、添加账号时，所有账号的会话互相同步，非 Pro 账号也包括在内").font(.system(size: 12)).foregroundStyle(Theme.muted)
                 }
             }
             .toggleStyle(.switch)
@@ -45,7 +45,7 @@ struct SessionSyncSheet: View {
             .overlay(RoundedRectangle(cornerRadius: Theme.radius, style: .continuous).stroke(Theme.line))
 
             if accounts.count < 2 {
-                Text("至少要有两个账号在桌面端登录过，才能互相同步")
+                Text("至少要有两个账号在桌面端用过（Pro 账号或非 Pro 账号），才能互相同步")
                     .font(.system(size: 13))
                     .foregroundStyle(Theme.muted)
                     .frame(maxWidth: .infinity, minHeight: 120)

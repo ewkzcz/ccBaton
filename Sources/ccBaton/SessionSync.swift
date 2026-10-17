@@ -4,6 +4,7 @@
  * 桌面端把 Code 会话的索引存在 claude-code-sessions/<账号ID>/<组织ID>/ 下，对话记录本身在 ~/.claude/projects，本来就是共用的。
  * 桌面端写索引时不接受软链接目录（报 ENOTDIR），所以每个账号保留自己的真实目录，靠复制文件同步。
  * 索引文件是 local_<ID>.json，删除会话后留下 deleted_<ID> 标记；同步时删除标记优先，同名索引保留较新的一份。
+ * 非 Pro 账号（第三方推理模式，接中转站、DeepSeek 等）的数据在另一个目录 Claude-3p 下，目录结构相同，一起参与同步。
  * 所有操作都要在桌面端没运行时进行，避免它写到一半的文件被覆盖。
  */
 import Foundation
@@ -15,12 +16,16 @@ struct SessionSync {
         let uuid: String
         let slots: [URL]
         let count: Int
+        /** 是否是非 Pro 账号（第三方推理模式） */
+        let thirdParty: Bool
 
         var id: String { uuid }
     }
 
     /** claude-code-sessions 目录 */
     let root: URL
+    /** 非 Pro 账号的 claude-code-sessions 目录（Claude-3p 下） */
+    var thirdPartyRoot: URL? = nil
     /** 旧版共享目录，修复后移走 */
     let legacy: URL
     /** 旧版共享目录移到这里备份 */
@@ -44,17 +49,21 @@ struct SessionSync {
         return copy
     }
 
-    /** 列出所有账号及其会话目录，按会话数从多到少排 */
+    /** 列出所有账号及其会话目录，Pro 账号和非 Pro 账号都算，按会话数从多到少排 */
     func accounts() -> [SessionAccount] {
-        Self.children(root)
-            .filter { !$0.lastPathComponent.hasPrefix(".") && Self.isDirectory($0) && !Self.isSymlink($0) }
-            .filter { only?.contains($0.lastPathComponent) ?? true }
-            .map { account in
-                let slots = Self.children(account).filter { Self.isDirectory($0) }
-                let ids = Set(slots.flatMap { Self.children($0).compactMap { Self.indexID($0.lastPathComponent) } })
-                return SessionAccount(uuid: account.lastPathComponent, slots: slots, count: ids.count)
-            }
-            .sorted { $0.count > $1.count }
+        let roots = [(root, false)] + (thirdPartyRoot.map { [($0, true)] } ?? [])
+        return roots.flatMap { dir, thirdParty in
+            Self.children(dir)
+                .filter { !$0.lastPathComponent.hasPrefix(".") && Self.isDirectory($0) && !Self.isSymlink($0) }
+                .filter { only?.contains($0.lastPathComponent) ?? true }
+                .map { account in
+                    let slots = Self.children(account).filter { Self.isDirectory($0) }
+                    let ids = Set(slots.flatMap { Self.children($0).compactMap { Self.indexID($0.lastPathComponent) } })
+                    return SessionAccount(uuid: account.lastPathComponent, slots: slots, count: ids.count,
+                                          thirdParty: thirdParty)
+                }
+        }
+        .sorted { $0.count > $1.count }
     }
 
     // MARK: - 同步
@@ -81,7 +90,7 @@ struct SessionSync {
      * 处理流程：
      * 1、收集来源里的删除标记，以及每个索引文件最新的一份
      * 2、删除标记复制到目标，并删掉目标里对应的索引
-     * 3、目标没删过的会话，缺的补上，旧的换成新的
+     * 3、目标没删过的会话，缺的补上，旧的换成新的；写进 Pro 账号时把第三方模型换成 Claude 模型
      */
     private func merge(from sources: [URL], to targets: [URL]) -> Int {
         // 1、收集来源里的删除标记，以及每个索引文件最新的一份
@@ -91,13 +100,16 @@ struct SessionSync {
             let name = file.lastPathComponent
             if let id = Self.tombID(name) {
                 tombs[id] = file
-            } else if Self.indexID(name) != nil, latest[name].map({ Self.mtime(file) > Self.mtime($0) }) ?? true {
+            } else if Self.indexID(name) != nil, latest[name].map({ Self.newer(file, than: $0) }) ?? true {
                 latest[name] = file
             }
         }
 
         var changed = 0
+        let thirdPartySlots = Set(accounts().filter(\.thirdParty).flatMap(\.slots).map(\.standardizedFileURL))
         for target in targets {
+            // Pro 账号的桌面端不认识第三方模型，迁移过来的会话改用这个账号常用的 Claude 模型
+            let claudeModel = thirdPartySlots.contains(target.standardizedFileURL) ? nil : Self.claudeModel(in: target)
             // 2、删除标记复制到目标，并删掉目标里对应的索引
             for (id, tomb) in tombs {
                 let dest = target.appendingPathComponent(tomb.lastPathComponent)
@@ -106,14 +118,14 @@ struct SessionSync {
                 if (try? FileManager.default.removeItem(at: index)) != nil { changed += 1 }
             }
 
-            // 3、目标没删过的会话，缺的补上，旧的换成新的
+            // 3、目标没删过的会话，缺的补上，旧的换成新的；写进 Pro 账号时把第三方模型换成 Claude 模型
             let deleted = Set(Self.children(target).compactMap { Self.tombID($0.lastPathComponent) })
             for (name, file) in latest {
                 guard let id = Self.indexID(name), !deleted.contains(id) else { continue }
                 let dest = target.appendingPathComponent(name)
                 guard dest.standardizedFileURL != file.standardizedFileURL else { continue }
-                if !FileManager.default.fileExists(atPath: dest.path) || Self.mtime(file) > Self.mtime(dest) {
-                    if Self.copy(file, to: dest) { changed += 1 }
+                if !FileManager.default.fileExists(atPath: dest.path) || Self.newer(file, than: dest) {
+                    if Self.copyIndex(file, to: dest, claudeModel: claudeModel) { changed += 1 }
                 }
             }
         }
@@ -279,8 +291,8 @@ struct SessionSync {
             "lastActivityAt": ms(info.lastActivityAt),
             "lastFocusedAt": ms(info.lastActivityAt),
             // 命令行可能接了第三方模型，桌面端不认识，只沿用 Claude 模型
-            "model": info.model.flatMap { $0.hasPrefix("claude-") ? $0 : nil }
-                ?? template["model"] as? String ?? "default",
+            "model": [info.model, template["model"] as? String].compactMap { $0 }.first(where: isClaudeModel)
+                ?? "default",
             "effort": template["effort"] as? String ?? "medium",
             "isArchived": false,
             "title": info.title,
@@ -308,6 +320,48 @@ struct SessionSync {
 
     private static func tombID(_ name: String) -> String? {
         name.hasPrefix(tombPrefix) ? String(name.dropFirst(tombPrefix.count)) : nil
+    }
+
+    /** 桌面端 Pro 账号认识的模型：Claude 模型或默认 */
+    private static func isClaudeModel(_ model: String) -> Bool {
+        model.hasPrefix("claude-") || model == "default"
+    }
+
+    /** 会话目录里最近一个会话用的 Claude 模型，没有就用默认 */
+    private static func claudeModel(in slot: URL) -> String {
+        children(slot)
+            .filter { indexID($0.lastPathComponent) != nil }
+            .sorted { mtime($0) > mtime($1) }
+            .lazy
+            .compactMap { readJSON($0)?["model"] as? String }
+            .first(where: isClaudeModel) ?? "default"
+    }
+
+    /**
+     * 复制一份会话索引
+     *
+     * claudeModel 不为空时（目标是 Pro 账号），索引里的第三方模型换成它，其余原样复制。
+     * 改写后的文件沿用原文件的修改时间，下次同步不会被当成新改动。
+     */
+    private static func copyIndex(_ src: URL, to dest: URL, claudeModel: String?) -> Bool {
+        guard let claudeModel, var obj = readJSON(src), let model = obj["model"] as? String,
+              !isClaudeModel(model) else { return copy(src, to: dest) }
+        obj["model"] = claudeModel
+        guard let data = try? JSONSerialization.data(withJSONObject: obj, options: [.withoutEscapingSlashes]) else {
+            return false
+        }
+        let fm = FileManager.default
+        let tmp = dest.deletingLastPathComponent().appendingPathComponent(".ccbaton-\(UUID().uuidString)")
+        do {
+            try data.write(to: tmp)
+            try fm.setAttributes([.posixPermissions: 0o600, .modificationDate: mtime(src)], ofItemAtPath: tmp.path)
+            if fm.fileExists(atPath: dest.path) { try fm.removeItem(at: dest) }
+            try fm.moveItem(at: tmp, to: dest)
+            return true
+        } catch {
+            try? fm.removeItem(at: tmp)
+            return false
+        }
     }
 
     /** 先复制到临时文件再换上，保留原文件的修改时间 */
@@ -341,6 +395,16 @@ struct SessionSync {
     static func isDirectory(_ url: URL) -> Bool {
         var dir: ObjCBool = false
         return FileManager.default.fileExists(atPath: url.path, isDirectory: &dir) && dir.boolValue
+    }
+
+    /**
+     * a 是否比 b 新
+     *
+     * 复制时用 Date 回写修改时间，纳秒部分存不下会被取整，副本可能比原件多出不到 1 微秒，
+     * 直接比较会把副本当成更新的一份来回复制，所以差距超过 1 毫秒才算更新。
+     */
+    static func newer(_ a: URL, than b: URL) -> Bool {
+        mtime(a).timeIntervalSince(mtime(b)) > 0.001
     }
 
     static func mtime(_ url: URL) -> Date {
